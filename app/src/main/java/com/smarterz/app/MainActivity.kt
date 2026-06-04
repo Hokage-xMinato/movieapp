@@ -177,7 +177,9 @@ class TmdbApi {
 
 class SmartWebViewClient(
     private val onPageReady: () -> Unit,
-    private val onError: ((String) -> Unit)? = null
+    private val onError: ((String) -> Unit)? = null,
+    private val screenCssW: Int = 393,   // CSS px width  (physicalPx / density)
+    private val screenCssH: Int = 851    // CSS px height (physicalPx / density)
 ) : WebViewClient() {
 
     // Only block schemes that would escape the WebView and launch another app.
@@ -189,7 +191,10 @@ class SmartWebViewClient(
 
     // JS injected into every frame to spoof desktop browser fingerprint
     // and ensure player controls (SVG icons, skip buttons) are fully visible.
-    private val SPOOF_JS = """
+    // screenCssW/H are the real device CSS pixels (physicalPx / density) passed
+    // from MainActivity so the iframe sees the same dimensions a real mobile
+    // browser would expose via screen.width / window.innerWidth etc.
+    private val SPOOF_JS get() = """
         (function() {
             try {
                 Object.defineProperty(navigator, 'webdriver',     { get: function() { return false; } });
@@ -199,6 +204,25 @@ class SmartWebViewClient(
                 Object.defineProperty(navigator, 'userAgent',     { get: function() {
                     return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
                 }});
+            } catch(e) {}
+
+            // Spoof screen/window dimensions to real device CSS pixels.
+            // With useWideViewPort=true + desktop UA the WebView's layout width
+            // is ~1280px, so window.innerWidth / screen.width would report desktop
+            // values and break the player's sizing logic. We override them here to
+            // match exactly what a real mobile browser on this device would report.
+            try {
+                var W = $screenCssW, H = $screenCssH;
+                ['width','availWidth'].forEach(function(p) {
+                    Object.defineProperty(screen, p, { get: function() { return W; } });
+                });
+                ['height','availHeight'].forEach(function(p) {
+                    Object.defineProperty(screen, p, { get: function() { return H; } });
+                });
+                Object.defineProperty(window, 'innerWidth',  { get: function() { return W; } });
+                Object.defineProperty(window, 'innerHeight', { get: function() { return H; } });
+                Object.defineProperty(window, 'outerWidth',  { get: function() { return W; } });
+                Object.defineProperty(window, 'outerHeight', { get: function() { return H; } });
             } catch(e) {}
 
             // Fix viewport so player renders at device width without desktop scaling.
@@ -662,6 +686,10 @@ class MainActivity : AppCompatActivity() {
         fullscreenContainer.visibility = View.GONE
         fullscreenContainer.setBackgroundColor(Color.BLACK)
 
+        val dm = resources.displayMetrics
+        val cssW = (dm.widthPixels  / dm.density).toInt()
+        val cssH = (dm.heightPixels / dm.density).toInt()
+
         playerWebView.webViewClient = SmartWebViewClient(
             onPageReady = { playerLoadingOverlay.visibility = View.GONE },
             onError = { message ->
@@ -673,7 +701,9 @@ class MainActivity : AppCompatActivity() {
                         .setPositiveButton("OK", null)
                         .show()
                 }
-            }
+            },
+            screenCssW = cssW,
+            screenCssH = cssH
         )
         playerWebView.webChromeClient = SmartChromeClient(
             fullscreenContainer = fullscreenContainer,
