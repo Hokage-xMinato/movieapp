@@ -356,7 +356,7 @@ class SmartChromeClient(
 
     // Suppress "Changes you made may not be saved" dialog when changing episodes
     override fun onJsBeforeUnload(
-        view: WebView?, url: String?, message: String?, result: JsBeforeUnloadResult?
+        view: WebView?, url: String?, message: String?, result: JsResult?
     ): Boolean { result?.cancel(); return true }
 }
 
