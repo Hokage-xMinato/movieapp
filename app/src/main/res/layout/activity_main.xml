@@ -139,11 +139,13 @@
                     <androidx.recyclerview.widget.RecyclerView
                         android:id="@+id/recentRecycler"
                         android:layout_width="match_parent"
-                        android:layout_height="310dp"
+                        android:layout_height="wrap_content"
                         android:visibility="gone"
                         android:clipToPadding="false"
-                        android:paddingStart="12dp"
-                        android:paddingEnd="12dp" />
+                        android:paddingStart="8dp"
+                        android:paddingEnd="8dp"
+                        android:paddingTop="4dp"
+                        android:paddingBottom="8dp" />
 
                     <TextView
                         android:layout_width="match_parent"
