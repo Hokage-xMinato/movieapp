@@ -160,8 +160,9 @@ class TmdbApi {
 }
 
 // ─── WebViewClient ─────────────────────────────────────────────────────────────
-// Loads the embed URL directly. Blocks intent/market/app-store schemes and known
-// ad redirect hosts. Allows all https navigation so player CDN hops work freely.
+// Minimal interception: let the player navigate freely (vidsrc hops through several
+// CDN domains internally). Only block dangerous non-http schemes.
+// Popup/new-tab blocking is handled by SmartChromeClient.onCreateWindow.
 
 class SmartWebViewClient(
     private val onPageReady: () -> Unit,
@@ -170,81 +171,29 @@ class SmartWebViewClient(
 
     // Schemes that must never load — ads use these to open apps / stores
     private val BLOCKED_SCHEMES = setOf(
-        "intent", "android-app", "market", "tel", "sms",
-        "mailto", "whatsapp", "tg"
+        "intent", "android-app", "market", "tel", "sms", "mailto", "whatsapp", "tg"
     )
-
-    // Hosts that are pure ad/redirect landing pages — block navigation to these
-    private val BLOCKED_HOSTS = setOf(
-        "googleadservices.com", "doubleclick.net", "googlesyndication.com",
-        "adservice.google.com", "ads.google.com", "pagead2.googlesyndication.com",
-        "play.google.com", "apps.apple.com", "itunes.apple.com"
-    )
-
-    // JS injected into EVERY page/frame to spoof browser fingerprint only.
-    // Do NOT touch window.location, window.open, or any navigation — the player needs those.
-    private val SPOOF_JS = """
-        (function() {
-            try {
-                Object.defineProperty(navigator, 'webdriver',    { get: function() { return false; } });
-                Object.defineProperty(navigator, 'platform',     { get: function() { return 'Win32'; } });
-                Object.defineProperty(navigator, 'vendor',       { get: function() { return 'Google Inc.'; } });
-                Object.defineProperty(navigator, 'maxTouchPoints',{ get: function() { return 0; } });
-                Object.defineProperty(navigator, 'userAgent',    { get: function() {
-                    return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
-                }});
-            } catch(e) {}
-        })();
-    """.trimIndent()
-
-    override fun shouldInterceptRequest(
-        view: WebView?,
-        request: WebResourceRequest?
-    ): WebResourceResponse? {
-        val scheme = request?.url?.scheme?.lowercase() ?: ""
-        // Block non-http/data/blob schemes at the resource level entirely
-        if (scheme !in listOf("https", "http", "data", "blob", "")) {
-            return WebResourceResponse("text/plain", "UTF-8", ByteArrayInputStream(ByteArray(0)))
-        }
-        return null // allow all http(s) resources through — player needs CDN, subtitles, etc.
-    }
 
     override fun shouldOverrideUrlLoading(
         view: WebView?,
         request: WebResourceRequest?
     ): Boolean {
-        val url = request?.url ?: return true
-        val scheme = url.scheme?.lowercase() ?: ""
-        // Block non-http schemes (intent://, market://, etc.)
+        val scheme = request?.url?.scheme?.lowercase() ?: return true
+        // Block dangerous non-http schemes — let everything else load in the WebView
         if (scheme in BLOCKED_SCHEMES) return true
-        if (scheme !in listOf("http", "https", "data", "blob")) return true
-        val host = url.host?.lowercase()?.removePrefix("www.") ?: return false
-        // Block known ad landing pages
-        return BLOCKED_HOSTS.any { host == it || host.endsWith(".$it") }
+        return false // load inside WebView
     }
 
     @Suppress("DEPRECATION")
     override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean {
         if (url == null) return true
-        if (url.startsWith("about:") || url.startsWith("data:") || url.startsWith("blob:")) return false
-        val uri = try { Uri.parse(url) } catch (e: Exception) { return true }
-        val scheme = uri.scheme?.lowercase() ?: ""
+        val scheme = try { Uri.parse(url).scheme?.lowercase() } catch (e: Exception) { return true }
         if (scheme in BLOCKED_SCHEMES) return true
-        if (scheme !in listOf("http", "https", "data", "blob")) return true
-        val host = uri.host?.lowercase()?.removePrefix("www.") ?: return false
-        return BLOCKED_HOSTS.any { host == it || host.endsWith(".$it") }
-    }
-
-    override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
-        super.onPageStarted(view, url, favicon)
-        // Inject spoofing JS as early as possible into every frame
-        view?.evaluateJavascript(SPOOF_JS, null)
+        return false // load inside WebView
     }
 
     override fun onPageFinished(view: WebView?, url: String?) {
         super.onPageFinished(view, url)
-        // Re-inject after page fully loads (some scripts overwrite navigator late)
-        view?.evaluateJavascript(SPOOF_JS, null)
         onPageReady()
     }
 
@@ -254,7 +203,6 @@ class SmartWebViewClient(
         error: WebResourceError?
     ) {
         super.onReceivedError(view, request, error)
-        // Only report errors for the main frame (not sub-resources like ads/trackers)
         if (request?.isForMainFrame == true) {
             val desc = error?.description?.toString() ?: "Unknown error"
             val code = error?.errorCode ?: -1
@@ -278,7 +226,7 @@ class SmartWebViewClient(
         super.onReceivedHttpError(view, request, errorResponse)
         if (request?.isForMainFrame == true) {
             val code = errorResponse?.statusCode ?: 0
-            onError?.invoke("Player failed to load (HTTP $code). Please try again.")
+            if (code >= 500) onError?.invoke("Player failed to load (HTTP $code). Please try again.")
         }
     }
 
