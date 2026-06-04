@@ -29,7 +29,6 @@ import com.google.gson.reflect.TypeToken
 import kotlinx.coroutines.*
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import java.io.ByteArrayInputStream
 import java.util.concurrent.TimeUnit
 
 // ─── Data Models ─────────────────────────────────────────────────────────────
@@ -160,77 +159,80 @@ class TmdbApi {
 }
 
 // ─── WebViewClient ─────────────────────────────────────────────────────────────
-// Loads the embed URL directly. Blocks intent/market/app-store schemes and known
-// ad redirect hosts. Allows all https navigation so player CDN hops work freely.
+// Philosophy: treat the WebView exactly like a browser iframe on a website.
+//
+// RESOURCES  (shouldInterceptRequest)  — allow everything, no exceptions.
+//   Iframes inside vidsrc can load fonts, HLS segments, subtitles, player JS,
+//   thumbnails from any CDN on any domain. We never touch resources.
+//
+// TOP-LEVEL NAVIGATION  (shouldOverrideUrlLoading)  — minimal blocking.
+//   Only hard-block non-http schemes (intent://, market://) that would escape
+//   the WebView and open another app. All http/https navigation is allowed so
+//   the vidsrc → cloudnestra → sub-player redirect chain completes naturally.
+//
+// POPUPS  (onCreateWindow in SmartChromeClient)  — strict allowlist.
+//   window.open / target=_blank are the only true "external" surface. Only
+//   vidsrc domains and cloudnestra.com may open a popup; everything else is
+//   silently dropped. Allowed popups are routed back into the same WebView.
 
 class SmartWebViewClient(
-    private val playerHosts: Set<String>,
     private val onPageReady: () -> Unit,
     private val onError: ((String) -> Unit)? = null
 ) : WebViewClient() {
 
-    // Schemes that must never load — ads use these to open apps / stores
-    private val BLOCKED_SCHEMES = setOf(
+    // Only block schemes that would escape the WebView and launch another app.
+    // Do NOT add http/https hosts here — that breaks the player redirect chain.
+    private val ESCAPE_SCHEMES = setOf(
         "intent", "android-app", "market", "tel", "sms",
-        "mailto", "whatsapp", "tg"
+        "mailto", "whatsapp", "tg", "viber", "fb", "twitter"
     )
 
-    // Hosts that are pure ad/redirect landing pages — block navigation to these
-    private val BLOCKED_HOSTS = setOf(
-        "googleadservices.com", "doubleclick.net", "googlesyndication.com",
-        "adservice.google.com", "ads.google.com", "pagead2.googlesyndication.com",
-        "play.google.com", "apps.apple.com", "itunes.apple.com"
-    )
-
-    // JS injected into EVERY page/frame to spoof browser fingerprint only.
-    // Do NOT touch window.location, window.open, or any navigation — the player needs those.
+    // JS injected into every frame to spoof desktop browser fingerprint.
+    // Never touches navigation — only read-only navigator properties.
     private val SPOOF_JS = """
         (function() {
             try {
-                Object.defineProperty(navigator, 'webdriver',    { get: function() { return false; } });
-                Object.defineProperty(navigator, 'platform',     { get: function() { return 'Win32'; } });
-                Object.defineProperty(navigator, 'vendor',       { get: function() { return 'Google Inc.'; } });
+                Object.defineProperty(navigator, 'webdriver',     { get: function() { return false; } });
+                Object.defineProperty(navigator, 'platform',      { get: function() { return 'Win32'; } });
+                Object.defineProperty(navigator, 'vendor',        { get: function() { return 'Google Inc.'; } });
                 Object.defineProperty(navigator, 'maxTouchPoints',{ get: function() { return 0; } });
-                Object.defineProperty(navigator, 'userAgent',    { get: function() {
+                Object.defineProperty(navigator, 'userAgent',     { get: function() {
                     return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
                 }});
             } catch(e) {}
         })();
     """.trimIndent()
 
+    // ── Resources: allow everything ──────────────────────────────────────────
+    // shouldInterceptRequest fires for every sub-resource inside every iframe.
+    // Returning null means "let the WebView handle it normally" — which is
+    // exactly what we want. CDN segments, subtitles, poster images, player JS,
+    // ad tracker pixels — all pass through. We are NOT an ad blocker at the
+    // resource level; our only job is keeping the video stream intact.
     override fun shouldInterceptRequest(
         view: WebView?,
         request: WebResourceRequest?
-    ): WebResourceResponse? {
-        val scheme = request?.url?.scheme?.lowercase() ?: ""
-        // Block non-http/data/blob schemes at the resource level entirely
-        if (scheme !in listOf("https", "http", "data", "blob", "")) {
-            return WebResourceResponse("text/plain", "UTF-8", ByteArrayInputStream(ByteArray(0)))
-        }
-        return null // allow all http(s) resources through — player needs CDN, subtitles, etc.
-    }
+    ): WebResourceResponse? = null  // never intercept — let everything load
 
+    // ── Top-level navigation: block only app-escape schemes ──────────────────
+    // shouldOverrideUrlLoading fires when the TOP-LEVEL WebView frame would
+    // navigate. It does NOT fire for iframe src changes or resource loads.
+    // We only block schemes that would open another app (intent, market, etc.).
+    // All http/https URLs are allowed — this is what lets the vidsrc redirect
+    // chain (vidsrc → cloudnestra → sub-player → CDN) complete inside the view.
     override fun shouldOverrideUrlLoading(
         view: WebView?,
         request: WebResourceRequest?
     ): Boolean {
         val url = request?.url ?: return true
         val scheme = url.scheme?.lowercase() ?: ""
-        // Block non-http schemes (intent://, market://, etc.)
-        if (scheme in BLOCKED_SCHEMES) return true
-        if (scheme !in listOf("http", "https", "data", "blob")) return true
-        val host = url.host?.lowercase()?.removePrefix("www.") ?: return false
-        // Block known ad landing pages
-        if (BLOCKED_HOSTS.any { host == it || host.endsWith(".$it") }) return true
-        // Allow navigation to known player hosts (embed chains, CDN hops, sub-players)
-        if (playerHosts.any { host == it || host.endsWith(".$it") }) return false
-        // Allow navigation that originates from a player host (referrer chain)
-        val referer = request.requestHeaders?.get("Referer") ?: ""
-        if (referer.isNotEmpty()) {
-            val refHost = Uri.parse(referer).host?.lowercase()?.removePrefix("www.") ?: ""
-            if (playerHosts.any { refHost == it || refHost.endsWith(".$it") }) return false
-        }
-        // Block everything else (ad redirect landing pages not in BLOCKED_HOSTS)
+        // Hard-block any scheme that would escape to another app
+        if (scheme in ESCAPE_SCHEMES) return true
+        // data: and blob: are internal — always allow
+        if (scheme == "data" || scheme == "blob") return false
+        // http/https: allow unconditionally — the player redirect chain needs this
+        if (scheme == "http" || scheme == "https") return false
+        // Unknown scheme: block to be safe
         return true
     }
 
@@ -238,45 +240,39 @@ class SmartWebViewClient(
     override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean {
         if (url == null) return true
         if (url.startsWith("about:") || url.startsWith("data:") || url.startsWith("blob:")) return false
-        val uri = try { Uri.parse(url) } catch (e: Exception) { return true }
-        val scheme = uri.scheme?.lowercase() ?: ""
-        if (scheme in BLOCKED_SCHEMES) return true
-        if (scheme !in listOf("http", "https", "data", "blob")) return true
-        val host = uri.host?.lowercase()?.removePrefix("www.") ?: return false
-        if (BLOCKED_HOSTS.any { host == it || host.endsWith(".$it") }) return true
-        // Allow known player hosts
-        if (playerHosts.any { host == it || host.endsWith(".$it") }) return false
-        // Block everything else
+        val scheme = try { Uri.parse(url).scheme?.lowercase() ?: "" } catch (e: Exception) { return true }
+        if (scheme in ESCAPE_SCHEMES) return true
+        if (scheme == "http" || scheme == "https") return false
         return true
     }
 
+    // ── Page lifecycle ────────────────────────────────────────────────────────
     override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
         super.onPageStarted(view, url, favicon)
-        // Inject spoofing JS as early as possible into every frame
         view?.evaluateJavascript(SPOOF_JS, null)
     }
 
     override fun onPageFinished(view: WebView?, url: String?) {
         super.onPageFinished(view, url)
-        // Re-inject after page fully loads (some scripts overwrite navigator late)
         view?.evaluateJavascript(SPOOF_JS, null)
-        // Only hide loading overlay when the TOP-LEVEL page finishes, not sub-frames/iframes
+        // Only fire onPageReady for the main frame, not sub-frame completions
         if (url != null && url != "about:blank" && view?.url == url) {
             onPageReady()
         }
     }
 
+    // ── Errors: only surface fatal main-frame failures ────────────────────────
     override fun onReceivedError(
         view: WebView?,
         request: WebResourceRequest?,
         error: WebResourceError?
     ) {
         super.onReceivedError(view, request, error)
-        // Only report errors for the main frame (not sub-resources like ads/trackers)
         if (request?.isForMainFrame == true) {
-            val desc = error?.description?.toString() ?: "Unknown error"
             val code = error?.errorCode ?: -1
-            onError?.invoke("Player error ($code): $desc")
+            val desc = error?.description?.toString() ?: "Unknown error"
+            // -2 = net::ERR_FAILED (common during redirect chain) — don't surface
+            if (code != -2) onError?.invoke("Player error ($code): $desc")
         }
     }
 
@@ -285,7 +281,7 @@ class SmartWebViewClient(
         view: WebView?, errorCode: Int, description: String?, failingUrl: String?
     ) {
         super.onReceivedError(view, errorCode, description, failingUrl)
-        onError?.invoke("Player error ($errorCode): ${description ?: "Unknown error"}")
+        if (errorCode != -2) onError?.invoke("Player error ($errorCode): ${description ?: "Unknown error"}")
     }
 
     override fun onReceivedHttpError(
@@ -294,15 +290,9 @@ class SmartWebViewClient(
         errorResponse: WebResourceResponse?
     ) {
         super.onReceivedHttpError(view, request, errorResponse)
-        // Only report HTTP errors for the main frame; sub-resources (ads, trackers, CDN)
-        // routinely return 4xx and should never trigger a user-visible error.
-        if (request?.isForMainFrame == true) {
-            val code = errorResponse?.statusCode ?: 0
-            // Ignore 404/403 on the main frame too — vidsrc mirrors sometimes return these
-            // on intermediate hops before redirecting to the actual player.
-            if (code >= 500) {
-                onError?.invoke("Player failed to load (HTTP $code). Please try again.")
-            }
+        // Only 5xx on the main frame is a real failure worth showing
+        if (request?.isForMainFrame == true && (errorResponse?.statusCode ?: 0) >= 500) {
+            onError?.invoke("Player failed to load (HTTP ${errorResponse?.statusCode}). Please try again.")
         }
     }
 
@@ -310,7 +300,6 @@ class SmartWebViewClient(
 }
 
 class SmartChromeClient(
-    private val playerHosts: Set<String>,
     private val fullscreenContainer: FrameLayout,
     private val onFullscreenEnter: () -> Unit,
     private val onFullscreenExit: () -> Unit
@@ -319,7 +308,17 @@ class SmartChromeClient(
     private var customView: View? = null
     private var customViewCallback: CustomViewCallback? = null
 
-    // Called when the video player requests fullscreen (user taps fullscreen button)
+    // Strict allowlist for window.open / target=_blank popups.
+    // These are the ONLY domains allowed to open a popup that routes back into
+    // the main WebView. Everything else (ad popunders, click-redirectors, etc.)
+    // is silently dropped by returning false from onCreateWindow.
+    private val POPUP_ALLOWED_HOSTS = setOf(
+        "vidsrc.me", "vidsrcme.ru", "vidsrc.to", "vidsrc.xyz",
+        "vidsrc.net", "vidsrc.in", "vidsrc.pm", "vidsrc.rip",
+        "cloudnestra.com"
+    )
+
+    // ── Fullscreen ────────────────────────────────────────────────────────────
     override fun onShowCustomView(view: View?, callback: CustomViewCallback?) {
         customView = view ?: return
         customViewCallback = callback
@@ -328,7 +327,6 @@ class SmartChromeClient(
         onFullscreenEnter()
     }
 
-    // Called when fullscreen is dismissed (user taps back/exit in fullscreen player)
     override fun onHideCustomView() {
         fullscreenContainer.removeView(customView)
         fullscreenContainer.visibility = View.GONE
@@ -341,36 +339,59 @@ class SmartChromeClient(
     fun isFullscreen() = customView != null
 
     fun exitFullscreenIfNeeded(): Boolean {
-        return if (customView != null) {
-            onHideCustomView()
-            true
-        } else false
+        return if (customView != null) { onHideCustomView(); true } else false
     }
 
-    // vidsrc sometimes opens sub-players via window.open — we allow those
-    // but route them back through the same WebView with the same restrictions.
-    // Any popup to an unknown host is silently dropped.
+    // ── Popup windows (window.open / target=_blank) ───────────────────────────
+    // This is the ONE place we enforce a strict allowlist.
+    // How it works:
+    //   1. Create a temporary invisible WebView to receive the popup.
+    //   2. That WebView's client intercepts the first navigation request.
+    //   3. If the destination host is in POPUP_ALLOWED_HOSTS, load it in the
+    //      MAIN WebView (so it plays inside the player, not a new window).
+    //   4. Anything else is silently dropped — the temp WebView is discarded.
+    //   5. The site never knows the popup was handled differently; it just
+    //      sees a successful window.open() return value.
     override fun onCreateWindow(
-        view: WebView?, isDialog: Boolean,
-        isUserGesture: Boolean, resultMsg: android.os.Message?
+        view: WebView?,
+        isDialog: Boolean,
+        isUserGesture: Boolean,
+        resultMsg: android.os.Message?
     ): Boolean {
-        val newWebView = WebView(view!!.context)
-        newWebView.webViewClient = object : WebViewClient() {
+        val mainView = view ?: return false
+        val transport = resultMsg?.obj as? WebView.WebViewTransport ?: return false
+
+        // Temp WebView — invisible, never added to the layout
+        val tempWebView = WebView(mainView.context)
+        tempWebView.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(v: WebView?, req: WebResourceRequest?): Boolean {
                 val host = req?.url?.host?.lowercase()?.removePrefix("www.") ?: return true
-                // Only route allowed hosts back into the main WebView
-                if (playerHosts.any { host == it || host.endsWith(".$it") }) {
-                    view.loadUrl(req.url.toString())
+                if (POPUP_ALLOWED_HOSTS.any { host == it || host.endsWith(".$it") }) {
+                    // Route allowed popup back into the main player WebView
+                    mainView.loadUrl(req.url.toString())
                 }
-                return true // always consume — never open external browser
+                // Always return true: consume the navigation, never open external browser
+                return true
+            }
+            @Suppress("DEPRECATION")
+            override fun shouldOverrideUrlLoading(v: WebView?, url: String?): Boolean {
+                if (url == null) return true
+                val host = try {
+                    Uri.parse(url).host?.lowercase()?.removePrefix("www.") ?: return true
+                } catch (e: Exception) { return true }
+                if (POPUP_ALLOWED_HOSTS.any { host == it || host.endsWith(".$it") }) {
+                    mainView.loadUrl(url)
+                }
+                return true
             }
         }
-        val transport = resultMsg?.obj as? WebView.WebViewTransport ?: return false
-        transport.webView = newWebView
+
+        transport.webView = tempWebView
         resultMsg.sendToTarget()
         return true
     }
 
+    // ── JS dialogs: suppress all ──────────────────────────────────────────────
     override fun onJsAlert(view: WebView?, url: String?, message: String?, result: JsResult?):
         Boolean { result?.cancel(); return true }
 
@@ -380,7 +401,6 @@ class SmartChromeClient(
     override fun onJsPrompt(view: WebView?, url: String?, message: String?,
         defaultValue: String?, result: JsPromptResult?): Boolean { result?.cancel(); return true }
 
-    // Suppress "Changes you made may not be saved" dialog when changing episodes
     override fun onJsBeforeUnload(
         view: WebView?, url: String?, message: String?, result: JsResult?
     ): Boolean { result?.cancel(); return true }
@@ -573,22 +593,7 @@ class MainActivity : AppCompatActivity() {
 
     @SuppressLint("SetJavaScriptEnabled")
     private fun setupWebView() {
-        val playerHosts = setOf(
-            "vidsrc.me", "vidsrcme.ru", "vidsrc.to", "vidsrc.xyz",
-            "vidsrc.net", "vidsrc.in", "vidsrc.pm", "vidsrc.rip",
-            "cloudnestra.com", "multiembed.mov", "moviesapi.club",
-            "embedme.top", "vid2fcdn.xyz", "superembed.stream",
-            // Common CDN / sub-player hops used by vidsrc embed chains
-            "rabbitstream.net", "megacloud.tv", "megacloud.store",
-            "rapid-cloud.co", "streamlare.com", "streamtape.com",
-            "filemoon.sx", "voe.sx", "upstream.to",
-            "embedsito.com", "2embed.org", "2embed.cc",
-            "smashystream.com", "autoembed.cc", "autoembed.to",
-            "player.smashy.stream", "notyourdropbox.com",
-            "frembed.pro", "frembed.fun"
-        )
         playerWebView.webViewClient = SmartWebViewClient(
-            playerHosts = playerHosts,
             onPageReady = { playerLoadingOverlay.visibility = View.GONE },
             onError = { message ->
                 runOnUiThread {
@@ -602,7 +607,6 @@ class MainActivity : AppCompatActivity() {
             }
         )
         playerWebView.webChromeClient = SmartChromeClient(
-            playerHosts = playerHosts,
             fullscreenContainer = fullscreenContainer,
             onFullscreenEnter = {
                 // Go true fullscreen: landscape, hide system UI
