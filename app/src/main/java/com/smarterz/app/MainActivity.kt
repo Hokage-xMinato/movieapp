@@ -160,41 +160,110 @@ class TmdbApi {
 }
 
 // ─── WebViewClient ─────────────────────────────────────────────────────────────
-// Minimal interception: let the player navigate freely (vidsrc hops through several
-// CDN domains internally). Only block dangerous non-http schemes.
-// Popup/new-tab blocking is handled by SmartChromeClient.onCreateWindow.
+// Loads the embed URL directly. Blocks intent/market/app-store schemes and known
+// ad redirect hosts. Allows all https navigation so player CDN hops work freely.
 
 class SmartWebViewClient(
+    private val playerHosts: Set<String>,
     private val onPageReady: () -> Unit,
     private val onError: ((String) -> Unit)? = null
 ) : WebViewClient() {
 
     // Schemes that must never load — ads use these to open apps / stores
     private val BLOCKED_SCHEMES = setOf(
-        "intent", "android-app", "market", "tel", "sms", "mailto", "whatsapp", "tg"
+        "intent", "android-app", "market", "tel", "sms",
+        "mailto", "whatsapp", "tg"
     )
+
+    // Hosts that are pure ad/redirect landing pages — block navigation to these
+    private val BLOCKED_HOSTS = setOf(
+        "googleadservices.com", "doubleclick.net", "googlesyndication.com",
+        "adservice.google.com", "ads.google.com", "pagead2.googlesyndication.com",
+        "play.google.com", "apps.apple.com", "itunes.apple.com"
+    )
+
+    // JS injected into EVERY page/frame to spoof browser fingerprint only.
+    // Do NOT touch window.location, window.open, or any navigation — the player needs those.
+    private val SPOOF_JS = """
+        (function() {
+            try {
+                Object.defineProperty(navigator, 'webdriver',    { get: function() { return false; } });
+                Object.defineProperty(navigator, 'platform',     { get: function() { return 'Win32'; } });
+                Object.defineProperty(navigator, 'vendor',       { get: function() { return 'Google Inc.'; } });
+                Object.defineProperty(navigator, 'maxTouchPoints',{ get: function() { return 0; } });
+                Object.defineProperty(navigator, 'userAgent',    { get: function() {
+                    return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+                }});
+            } catch(e) {}
+        })();
+    """.trimIndent()
+
+    override fun shouldInterceptRequest(
+        view: WebView?,
+        request: WebResourceRequest?
+    ): WebResourceResponse? {
+        val scheme = request?.url?.scheme?.lowercase() ?: ""
+        // Block non-http/data/blob schemes at the resource level entirely
+        if (scheme !in listOf("https", "http", "data", "blob", "")) {
+            return WebResourceResponse("text/plain", "UTF-8", ByteArrayInputStream(ByteArray(0)))
+        }
+        return null // allow all http(s) resources through — player needs CDN, subtitles, etc.
+    }
 
     override fun shouldOverrideUrlLoading(
         view: WebView?,
         request: WebResourceRequest?
     ): Boolean {
-        val scheme = request?.url?.scheme?.lowercase() ?: return true
-        // Block dangerous non-http schemes — let everything else load in the WebView
+        val url = request?.url ?: return true
+        val scheme = url.scheme?.lowercase() ?: ""
+        // Block non-http schemes (intent://, market://, etc.)
         if (scheme in BLOCKED_SCHEMES) return true
-        return false // load inside WebView
+        if (scheme !in listOf("http", "https", "data", "blob")) return true
+        val host = url.host?.lowercase()?.removePrefix("www.") ?: return false
+        // Block known ad landing pages
+        if (BLOCKED_HOSTS.any { host == it || host.endsWith(".$it") }) return true
+        // Allow navigation to known player hosts (embed chains, CDN hops, sub-players)
+        if (playerHosts.any { host == it || host.endsWith(".$it") }) return false
+        // Allow navigation that originates from a player host (referrer chain)
+        val referer = request.requestHeaders?.get("Referer") ?: ""
+        if (referer.isNotEmpty()) {
+            val refHost = Uri.parse(referer).host?.lowercase()?.removePrefix("www.") ?: ""
+            if (playerHosts.any { refHost == it || refHost.endsWith(".$it") }) return false
+        }
+        // Block everything else (ad redirect landing pages not in BLOCKED_HOSTS)
+        return true
     }
 
     @Suppress("DEPRECATION")
     override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean {
         if (url == null) return true
-        val scheme = try { Uri.parse(url).scheme?.lowercase() } catch (e: Exception) { return true }
+        if (url.startsWith("about:") || url.startsWith("data:") || url.startsWith("blob:")) return false
+        val uri = try { Uri.parse(url) } catch (e: Exception) { return true }
+        val scheme = uri.scheme?.lowercase() ?: ""
         if (scheme in BLOCKED_SCHEMES) return true
-        return false // load inside WebView
+        if (scheme !in listOf("http", "https", "data", "blob")) return true
+        val host = uri.host?.lowercase()?.removePrefix("www.") ?: return false
+        if (BLOCKED_HOSTS.any { host == it || host.endsWith(".$it") }) return true
+        // Allow known player hosts
+        if (playerHosts.any { host == it || host.endsWith(".$it") }) return false
+        // Block everything else
+        return true
+    }
+
+    override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+        super.onPageStarted(view, url, favicon)
+        // Inject spoofing JS as early as possible into every frame
+        view?.evaluateJavascript(SPOOF_JS, null)
     }
 
     override fun onPageFinished(view: WebView?, url: String?) {
         super.onPageFinished(view, url)
-        onPageReady()
+        // Re-inject after page fully loads (some scripts overwrite navigator late)
+        view?.evaluateJavascript(SPOOF_JS, null)
+        // Only hide loading overlay when the TOP-LEVEL page finishes, not sub-frames/iframes
+        if (url != null && url != "about:blank" && view?.url == url) {
+            onPageReady()
+        }
     }
 
     override fun onReceivedError(
@@ -203,6 +272,7 @@ class SmartWebViewClient(
         error: WebResourceError?
     ) {
         super.onReceivedError(view, request, error)
+        // Only report errors for the main frame (not sub-resources like ads/trackers)
         if (request?.isForMainFrame == true) {
             val desc = error?.description?.toString() ?: "Unknown error"
             val code = error?.errorCode ?: -1
@@ -224,9 +294,15 @@ class SmartWebViewClient(
         errorResponse: WebResourceResponse?
     ) {
         super.onReceivedHttpError(view, request, errorResponse)
+        // Only report HTTP errors for the main frame; sub-resources (ads, trackers, CDN)
+        // routinely return 4xx and should never trigger a user-visible error.
         if (request?.isForMainFrame == true) {
             val code = errorResponse?.statusCode ?: 0
-            if (code >= 500) onError?.invoke("Player failed to load (HTTP $code). Please try again.")
+            // Ignore 404/403 on the main frame too — vidsrc mirrors sometimes return these
+            // on intermediate hops before redirecting to the actual player.
+            if (code >= 500) {
+                onError?.invoke("Player failed to load (HTTP $code). Please try again.")
+            }
         }
     }
 
@@ -501,9 +577,18 @@ class MainActivity : AppCompatActivity() {
             "vidsrc.me", "vidsrcme.ru", "vidsrc.to", "vidsrc.xyz",
             "vidsrc.net", "vidsrc.in", "vidsrc.pm", "vidsrc.rip",
             "cloudnestra.com", "multiembed.mov", "moviesapi.club",
-            "embedme.top", "vid2fcdn.xyz", "superembed.stream"
+            "embedme.top", "vid2fcdn.xyz", "superembed.stream",
+            // Common CDN / sub-player hops used by vidsrc embed chains
+            "rabbitstream.net", "megacloud.tv", "megacloud.store",
+            "rapid-cloud.co", "streamlare.com", "streamtape.com",
+            "filemoon.sx", "voe.sx", "upstream.to",
+            "embedsito.com", "2embed.org", "2embed.cc",
+            "smashystream.com", "autoembed.cc", "autoembed.to",
+            "player.smashy.stream", "notyourdropbox.com",
+            "frembed.pro", "frembed.fun"
         )
         playerWebView.webViewClient = SmartWebViewClient(
+            playerHosts = playerHosts,
             onPageReady = { playerLoadingOverlay.visibility = View.GONE },
             onError = { message ->
                 runOnUiThread {
