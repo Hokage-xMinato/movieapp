@@ -195,8 +195,6 @@ class SmartWebViewClient(
                 Object.defineProperty(navigator, 'webdriver', { get: function() { return false; } });
             } catch(e) {}
 
-            // Fix viewport so player renders at accurate mobile device width.
-            // This ensures skip buttons and all player controls are visible and tappable.
             try {
                 var existing = document.querySelector('meta[name=viewport]');
                 var content = 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no';
@@ -208,6 +206,16 @@ class SmartWebViewClient(
                     m.content = content;
                     (document.head || document.documentElement).appendChild(m);
                 }
+            } catch(e) {}
+
+            // Prevent ad scripts from force-exiting fullscreen when their invisible overlay is clicked.
+            try {
+                var keepFullscreen = function() { return Promise.resolve(); };
+                document.exitFullscreen = keepFullscreen;
+                document.webkitExitFullscreen = keepFullscreen;
+                document.webkitCancelFullScreen = keepFullscreen;
+                document.mozCancelFullScreen = keepFullscreen;
+                document.msExitFullscreen = keepFullscreen;
             } catch(e) {}
         })();
     """.trimIndent()
@@ -408,8 +416,14 @@ class SmartChromeClient(
         val mainView = view ?: return false
         val transport = resultMsg?.obj as? WebView.WebViewTransport ?: return false
 
-        // Temp WebView — invisible, never added to the layout
-        val tempWebView = WebView(mainView.context)
+        // Temp WebView — strictly invisible and unfocusable so it doesn't steal 
+        // Android window focus and accidentally dismiss the fullscreen CustomView.
+        val tempWebView = WebView(mainView.context).apply {
+            visibility = View.GONE
+            isFocusable = false
+            isFocusableInTouchMode = false
+        }
+        
         tempWebView.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(v: WebView?, req: WebResourceRequest?): Boolean {
                 val host = req?.url?.host?.lowercase()?.removePrefix("www.") ?: return true
