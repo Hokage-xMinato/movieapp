@@ -403,7 +403,7 @@ class MediaAdapter(
                 .transition(DrawableTransitionOptions.withCrossFade())
                 .placeholder(R.drawable.poster_placeholder)
                 .error(R.drawable.poster_placeholder)
-                .fitCenter()
+                .centerCrop()
                 .into(h.poster)
         } else {
             h.poster.setImageResource(R.drawable.poster_placeholder)
@@ -565,8 +565,8 @@ class MainActivity : AppCompatActivity() {
         s.allowContentAccess = false
         s.setSupportMultipleWindows(true)
         s.javaScriptCanOpenWindowsAutomatically = true
-        s.loadWithOverviewMode = true
-        s.useWideViewPort = true
+        s.loadWithOverviewMode = false
+        s.useWideViewPort = false
         // Full desktop Chrome 124 UA — no "Android", no "Mobile", no "wv" (WebView marker)
         // This is the single most important thing to make vidsrc not redirect to google.com
         s.userAgentString =
@@ -587,8 +587,7 @@ class MainActivity : AppCompatActivity() {
             onClick = { loadContent(it.id, it.type, it.season, it.episode) },
             onRemove = { storage.remove(it.id, it.type); renderRecent() }
         )
-        recentRecycler.layoutManager =
-            LinearLayoutManager(this, LinearLayoutManager.HORIZONTAL, false)
+        recentRecycler.layoutManager = GridLayoutManager(this, 3)
         recentRecycler.adapter = recentAdapter
 
         searchAdapter = MediaAdapter(
@@ -806,77 +805,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Loads the embed URL inside a zero-chrome iframe wrapper page.
-     *
-     * Key tricks that make vidsrc work and not redirect to google.com:
-     *  1. loadDataWithBaseURL with base = "https://vidsrc.me/" so the page
-     *     appears to be hosted ON vidsrc.me — this satisfies same-origin checks
-     *     and makes document.referrer and window.location.host look correct.
-     *  2. Desktop UA (set in setupWebView) removes the "wv" WebView marker.
-     *  3. The SPOOF_JS (injected by SmartWebViewClient) removes navigator.webdriver
-     *     and all other Android/WebView fingerprint properties.
-     *  4. referrerpolicy="no-referrer" on the iframe stops the outer page leaking
-     *     our fake base URL into the iframe's Referer header.
-     *  5. All top-frame navigations away from player hosts are blocked by
-     *     shouldOverrideUrlLoading — ads cannot redirect us anywhere.
+     * Loads the embed URL directly in the WebView.
+     * Ad redirects are blocked by SmartWebViewClient.shouldOverrideUrlLoading.
      */
     private fun loadPlayerFrame(embedUrl: String) {
-        val html = """<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-html,body{width:100%;height:100%;background:#000;overflow:hidden}
-iframe{width:100%;height:100%;border:none;display:block}
-</style>
-</head>
-<body>
-<iframe
-  id="player"
-  src="$embedUrl"
-  allowfullscreen="true"
-  webkitallowfullscreen="true"
-  mozallowfullscreen="true"
-  allow="autoplay; fullscreen; encrypted-media; picture-in-picture; web-share"
-  referrerpolicy="no-referrer"
-  scrolling="no"
-  frameborder="0">
-</iframe>
-<script>
-// Completely remove beforeunload so the "changes not saved" dialog never appears
-window.onbeforeunload = null;
-window.addEventListener = (function(orig) {
-  return function(type, handler, opts) {
-    if (type === 'beforeunload') return; // swallow
-    return orig.call(this, type, handler, opts);
-  };
-})(window.addEventListener);
-// Prevent the outer wrapper page from ever navigating away
-try {
-  Object.defineProperty(window, 'location', {
-    configurable: false,
-    get: function() { return location; },
-    set: function() { /* blocked */ }
-  });
-} catch(e) {}
-// Report iframe load errors to Android via URL scheme
-var iframe = document.getElementById('player');
-iframe.addEventListener('error', function() {
-  window.__playerError = true;
-}, true);
-</script>
-</body>
-</html>"""
-        // Base URL = vidsrc.me so the page looks hosted there (defeats bot/app detection)
-        playerWebView.loadDataWithBaseURL(
-            "https://vidsrc.me/",
-            html,
-            "text/html",
-            "UTF-8",
-            null
-        )
+        playerWebView.loadUrl(embedUrl)
     }
 
     private fun closePlayer() {
