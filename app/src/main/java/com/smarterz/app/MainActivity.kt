@@ -203,6 +203,24 @@ class SmartWebViewClient(
         })();
     """.trimIndent()
 
+    // JS injected after page load to ensure the viewport meta tag is set correctly
+    // so the vidsrc player renders at the WebView's actual pixel width (not at a
+    // desktop-scale 1280px then shrunk). Without this, skip/forward buttons are
+    // tiny because the player lays itself out at full desktop width.
+    private val VIEWPORT_FIX_JS = """
+        (function() {
+            try {
+                var meta = document.querySelector('meta[name="viewport"]');
+                if (!meta) {
+                    meta = document.createElement('meta');
+                    meta.name = 'viewport';
+                    document.head.appendChild(meta);
+                }
+                meta.content = 'width=device-width, initial-scale=1.0, maximum-scale=1.0';
+            } catch(e) {}
+        })();
+    """.trimIndent()
+
     // ── Resources: allow everything ──────────────────────────────────────────
     // shouldInterceptRequest fires for every sub-resource inside every iframe.
     // Returning null means "let the WebView handle it normally" — which is
@@ -214,12 +232,18 @@ class SmartWebViewClient(
         request: WebResourceRequest?
     ): WebResourceResponse? = null  // never intercept — let everything load
 
-    // ── Top-level navigation: block only app-escape schemes ──────────────────
+    // Hosts whose ROOT page (path "/" or empty) should be blocked to prevent
+    // the user landing on the main website. Embed sub-paths on these hosts
+    // (e.g. /embed/movie/…) are still allowed — only the bare homepage is blocked.
+    private val BLOCK_ROOT_HOSTS = setOf("vidsrcme.ru")
+
+    // ── Top-level navigation: block app-escape schemes + specific root pages ──
     // shouldOverrideUrlLoading fires when the TOP-LEVEL WebView frame would
     // navigate. It does NOT fire for iframe src changes or resource loads.
-    // We only block schemes that would open another app (intent, market, etc.).
-    // All http/https URLs are allowed — this is what lets the vidsrc redirect
-    // chain (vidsrc → cloudnestra → sub-player → CDN) complete inside the view.
+    // We only block (a) schemes that would open another app, and (b) navigations
+    // to the bare homepage of hosts in BLOCK_ROOT_HOSTS (path is "/" or empty).
+    // All other http/https URLs are allowed so the vidsrc redirect chain
+    // (vidsrc → cloudnestra → sub-player → CDN) completes inside the view.
     override fun shouldOverrideUrlLoading(
         view: WebView?,
         request: WebResourceRequest?
@@ -230,8 +254,13 @@ class SmartWebViewClient(
         if (scheme in ESCAPE_SCHEMES) return true
         // data: and blob: are internal — always allow
         if (scheme == "data" || scheme == "blob") return false
-        // http/https: allow unconditionally — the player redirect chain needs this
-        if (scheme == "http" || scheme == "https") return false
+        if (scheme == "http" || scheme == "https") {
+            // Block navigations to the bare root of BLOCK_ROOT_HOSTS
+            val host = url.host?.lowercase()?.removePrefix("www.") ?: ""
+            val path = url.path ?: ""
+            if (host in BLOCK_ROOT_HOSTS && (path.isEmpty() || path == "/")) return true
+            return false
+        }
         // Unknown scheme: block to be safe
         return true
     }
@@ -240,9 +269,15 @@ class SmartWebViewClient(
     override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean {
         if (url == null) return true
         if (url.startsWith("about:") || url.startsWith("data:") || url.startsWith("blob:")) return false
-        val scheme = try { Uri.parse(url).scheme?.lowercase() ?: "" } catch (e: Exception) { return true }
+        val parsed = try { Uri.parse(url) } catch (e: Exception) { return true }
+        val scheme = parsed.scheme?.lowercase() ?: ""
         if (scheme in ESCAPE_SCHEMES) return true
-        if (scheme == "http" || scheme == "https") return false
+        if (scheme == "http" || scheme == "https") {
+            val host = parsed.host?.lowercase()?.removePrefix("www.") ?: ""
+            val path = parsed.path ?: ""
+            if (host in BLOCK_ROOT_HOSTS && (path.isEmpty() || path == "/")) return true
+            return false
+        }
         return true
     }
 
@@ -250,11 +285,13 @@ class SmartWebViewClient(
     override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
         super.onPageStarted(view, url, favicon)
         view?.evaluateJavascript(SPOOF_JS, null)
+        view?.evaluateJavascript(VIEWPORT_FIX_JS, null)
     }
 
     override fun onPageFinished(view: WebView?, url: String?) {
         super.onPageFinished(view, url)
         view?.evaluateJavascript(SPOOF_JS, null)
+        view?.evaluateJavascript(VIEWPORT_FIX_JS, null)
         // Only fire onPageReady for the main frame, not sub-frame completions
         if (url != null && url != "about:blank" && view?.url == url) {
             onPageReady()
@@ -513,6 +550,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var detailOverview: TextView
     private lateinit var playButton: Button
     private lateinit var playerModal: LinearLayout
+    private lateinit var playerTitleBar: LinearLayout
     private lateinit var videoContainer: FrameLayout
     private lateinit var fullscreenContainer: FrameLayout
     private lateinit var closePlayer: ImageButton
@@ -586,6 +624,7 @@ class MainActivity : AppCompatActivity() {
         detailOverview = findViewById(R.id.detailOverview)
         playButton = findViewById(R.id.playButton)
         playerModal = findViewById(R.id.playerModal)
+        playerTitleBar = findViewById(R.id.playerTitleBar)
         videoContainer = findViewById(R.id.videoContainer)
         fullscreenContainer = findViewById(R.id.fullscreenContainer)
         closePlayer = findViewById(R.id.closePlayer)
@@ -649,18 +688,29 @@ class MainActivity : AppCompatActivity() {
                     ctrl.systemBarsBehavior =
                         WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
                 }
-                // Hide the entire playerModal so the app chrome (title, controls)
-                // disappears — only the fullscreenContainer (attached to decor root)
-                // is visible, covering 100% of the window.
-                playerModal.visibility = View.INVISIBLE
+                // Hide only the player chrome (title bar + controls) — NOT the whole
+                // playerModal. If we hide playerModal the window background (#0a0a0f)
+                // bleeds through behind the fullscreenContainer (which is on the decor
+                // root). Keeping playerModal VISIBLE but invisible-chrome means the
+                // black background of playerModal fills the window while fullscreen.
+                playerTitleBar.visibility = View.GONE
+                tvControls.visibility = View.GONE
+                movieControls.visibility = View.GONE
             },
             onFullscreenExit = {
-                // Restore portrait, system UI, and player modal
+                // Restore portrait, system UI, and all player chrome
                 requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
                 WindowCompat.setDecorFitsSystemWindows(window, true)
                 WindowInsetsControllerCompat(window, window.decorView)
                     .show(WindowInsetsCompat.Type.systemBars())
-                playerModal.visibility = View.VISIBLE
+                playerTitleBar.visibility = View.VISIBLE
+                // Restore controls visibility to whatever they were before fullscreen
+                // (tvControls is shown for TV, movieControls for movies)
+                if (currentType == "tv") {
+                    tvControls.visibility = View.VISIBLE
+                } else {
+                    movieControls.visibility = View.VISIBLE
+                }
             }
         ).also { chromeClient = it }
         val s = playerWebView.settings
@@ -900,6 +950,9 @@ class MainActivity : AppCompatActivity() {
     // ─── Player ──────────────────────────────────────────────────────────────
 
     private fun openPlayer(type: String) {
+        // If the player is already visible, don't reload — the user tapped "Play"
+        // from the detail page while the player modal was already open.
+        if (playerModal.visibility == View.VISIBLE) return
         playerModal.visibility = View.VISIBLE
         playerLoadingOverlay.visibility = View.VISIBLE
         playerTitle.text = detailTitle.text
