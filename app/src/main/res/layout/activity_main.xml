@@ -374,42 +374,60 @@
     </LinearLayout>
 
     <!-- ── PLAYER MODAL — sibling of full shell, covers everything including top bar ── -->
-    <FrameLayout
+    <LinearLayout
         android:id="@+id/playerModal"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
+        android:orientation="vertical"
         android:background="#000000"
         android:visibility="gone">
 
-        <WebView
-            android:id="@+id/playerWebView"
-            android:layout_width="match_parent"
-            android:layout_height="match_parent"
-            android:background="#000000" />
-
-        <!-- Loading overlay shown while WebView loads -->
+        <!-- 16:9 video container -->
         <FrameLayout
-            android:id="@+id/playerLoadingOverlay"
+            android:id="@+id/videoContainer"
             android:layout_width="match_parent"
-            android:layout_height="match_parent"
-            android:background="#000000"
-            android:visibility="visible">
+            android:layout_height="0dp"
+            android:layout_weight="0"
+            android:background="#000000">
 
-            <ProgressBar
-                android:id="@+id/playerLoadingSpinner"
-                android:layout_width="56dp"
-                android:layout_height="56dp"
-                android:layout_gravity="center"
-                android:indeterminateTint="#E50914" />
+            <!-- This height is set programmatically to screen_width * 9/16 -->
+            <WebView
+                android:id="@+id/playerWebView"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:background="#000000" />
+
+            <!-- Fullscreen custom view container (hidden until fullscreen) -->
+            <FrameLayout
+                android:id="@+id/fullscreenContainer"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:background="#000000"
+                android:visibility="gone" />
+
+            <!-- Loading overlay -->
+            <FrameLayout
+                android:id="@+id/playerLoadingOverlay"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:background="#000000"
+                android:visibility="visible">
+
+                <ProgressBar
+                    android:id="@+id/playerLoadingSpinner"
+                    android:layout_width="56dp"
+                    android:layout_height="56dp"
+                    android:layout_gravity="center"
+                    android:indeterminateTint="#E50914" />
+            </FrameLayout>
         </FrameLayout>
 
-        <!-- Top bar inside player -->
+        <!-- Title bar directly below video -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="48dp"
-            android:layout_gravity="top"
             android:orientation="horizontal"
-            android:background="#CC000000"
+            android:background="#12121a"
             android:gravity="center_vertical"
             android:paddingStart="8dp"
             android:paddingEnd="8dp">
@@ -449,18 +467,17 @@
             </LinearLayout>
         </LinearLayout>
 
-        <!-- TV controls at bottom -->
+        <!-- TV controls below title bar — never overlaps video -->
         <LinearLayout
             android:id="@+id/tvControls"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_gravity="bottom"
             android:orientation="vertical"
-            android:background="#E6000000"
+            android:background="#12121a"
             android:paddingStart="12dp"
             android:paddingEnd="12dp"
-            android:paddingTop="10dp"
-            android:paddingBottom="10dp"
+            android:paddingTop="12dp"
+            android:paddingBottom="12dp"
             android:visibility="gone">
 
             <!-- Spinners row -->
@@ -468,7 +485,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:orientation="horizontal"
-                android:layout_marginBottom="8dp">
+                android:layout_marginBottom="10dp">
 
                 <Spinner
                     android:id="@+id/seasonSpinner"
@@ -516,15 +533,14 @@
             </LinearLayout>
         </LinearLayout>
 
-        <!-- Movie controls placeholder -->
+        <!-- Movie controls placeholder (empty, kept for code compatibility) -->
         <LinearLayout
             android:id="@+id/movieControls"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_gravity="bottom"
             android:orientation="horizontal"
             android:visibility="gone" />
 
-    </FrameLayout>
+    </LinearLayout>
 
 </FrameLayout>
