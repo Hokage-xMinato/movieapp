@@ -1,23 +1,24 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
-    android:layout_width="160dp"
+    android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:orientation="vertical"
-    android:layout_marginStart="6dp"
-    android:layout_marginEnd="6dp"
+    android:layout_marginStart="4dp"
+    android:layout_marginEnd="4dp"
+    android:layout_marginBottom="8dp"
     android:background="@drawable/card_bg"
     android:clipToPadding="false">
 
     <!-- Poster -->
     <FrameLayout
-        android:layout_width="160dp"
-        android:layout_height="220dp">
+        android:layout_width="match_parent"
+        android:layout_height="180dp">
 
         <ImageView
             android:id="@+id/cardPoster"
             android:layout_width="match_parent"
             android:layout_height="match_parent"
-            android:scaleType="fitCenter"
+            android:scaleType="centerCrop"
             android:background="#1a1a2e"
             android:contentDescription="Poster" />
 
@@ -51,14 +52,14 @@
             android:padding="4dp" />
     </FrameLayout>
 
-    <!-- Text info - fixed height so content never gets cut -->
+    <!-- Text info -->
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="vertical"
         android:paddingStart="8dp"
         android:paddingEnd="8dp"
-        android:paddingTop="8dp"
+        android:paddingTop="6dp"
         android:paddingBottom="8dp">
 
         <TextView
@@ -70,7 +71,7 @@
             android:textStyle="bold"
             android:maxLines="2"
             android:ellipsize="end"
-            android:layout_marginBottom="4dp" />
+            android:layout_marginBottom="2dp" />
 
         <TextView
             android:id="@+id/cardDetail"
