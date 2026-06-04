@@ -163,7 +163,8 @@ class TmdbApi {
 // Resource requests (scripts, media, XHR) are allowed freely so the player works.
 
 class SmartWebViewClient(
-    private val onPageReady: () -> Unit
+    private val onPageReady: () -> Unit,
+    private val onError: ((String) -> Unit)? = null
 ) : WebViewClient() {
 
     // Hosts whose pages are allowed to load in the top frame (our wrapper + player domains)
@@ -279,6 +280,40 @@ class SmartWebViewClient(
         onPageReady()
     }
 
+    override fun onReceivedError(
+        view: WebView?,
+        request: WebResourceRequest?,
+        error: WebResourceError?
+    ) {
+        super.onReceivedError(view, request, error)
+        // Only report errors for the main frame (not sub-resources like ads/trackers)
+        if (request?.isForMainFrame == true) {
+            val desc = error?.description?.toString() ?: "Unknown error"
+            val code = error?.errorCode ?: -1
+            onError?.invoke("Player error ($code): $desc")
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onReceivedError(
+        view: WebView?, errorCode: Int, description: String?, failingUrl: String?
+    ) {
+        super.onReceivedError(view, errorCode, description, failingUrl)
+        onError?.invoke("Player error ($errorCode): ${description ?: "Unknown error"}")
+    }
+
+    override fun onReceivedHttpError(
+        view: WebView?,
+        request: WebResourceRequest?,
+        errorResponse: WebResourceResponse?
+    ) {
+        super.onReceivedHttpError(view, request, errorResponse)
+        if (request?.isForMainFrame == true) {
+            val code = errorResponse?.statusCode ?: 0
+            onError?.invoke("Player failed to load (HTTP $code). Please try again.")
+        }
+    }
+
     override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?) = true
 }
 
@@ -318,6 +353,11 @@ class SmartChromeClient(
 
     override fun onJsPrompt(view: WebView?, url: String?, message: String?,
         defaultValue: String?, result: JsPromptResult?): Boolean { result?.cancel(); return true }
+
+    // Suppress "Changes you made may not be saved" dialog when changing episodes
+    override fun onJsBeforeUnload(
+        view: WebView?, url: String?, message: String?, result: JsBeforeUnloadResult?
+    ): Boolean { result?.cancel(); return true }
 }
 
 // ─── RecyclerView Adapter ─────────────────────────────────────────────────────
@@ -363,7 +403,7 @@ class MediaAdapter(
                 .transition(DrawableTransitionOptions.withCrossFade())
                 .placeholder(R.drawable.poster_placeholder)
                 .error(R.drawable.poster_placeholder)
-                .centerCrop()
+                .fitCenter()
                 .into(h.poster)
         } else {
             h.poster.setImageResource(R.drawable.poster_placeholder)
@@ -501,9 +541,19 @@ class MainActivity : AppCompatActivity() {
             "cloudnestra.com", "multiembed.mov", "moviesapi.club",
             "embedme.top", "vid2fcdn.xyz", "superembed.stream"
         )
-        playerWebView.webViewClient = SmartWebViewClient {
-            playerLoadingOverlay.visibility = View.GONE
-        }
+        playerWebView.webViewClient = SmartWebViewClient(
+            onPageReady = { playerLoadingOverlay.visibility = View.GONE },
+            onError = { message ->
+                runOnUiThread {
+                    playerLoadingOverlay.visibility = View.GONE
+                    android.app.AlertDialog.Builder(this)
+                        .setTitle("Playback Error")
+                        .setMessage(message)
+                        .setPositiveButton("OK", null)
+                        .show()
+                }
+            }
+        )
         playerWebView.webChromeClient = SmartChromeClient(playerHosts)
         val s = playerWebView.settings
         s.javaScriptEnabled = true
@@ -795,16 +845,27 @@ iframe{width:100%;height:100%;border:none;display:block}
   frameborder="0">
 </iframe>
 <script>
+// Completely remove beforeunload so the "changes not saved" dialog never appears
+window.onbeforeunload = null;
+window.addEventListener = (function(orig) {
+  return function(type, handler, opts) {
+    if (type === 'beforeunload') return; // swallow
+    return orig.call(this, type, handler, opts);
+  };
+})(window.addEventListener);
 // Prevent the outer wrapper page from ever navigating away
-window.addEventListener('beforeunload',function(e){e.preventDefault();e.stopImmediatePropagation();return false;},true);
-// Nuke any attempt to set top.location from inside the iframe
-try{
-  Object.defineProperty(window,'location',{
-    configurable:false,
-    get:function(){return location;},
-    set:function(){/* blocked */}
+try {
+  Object.defineProperty(window, 'location', {
+    configurable: false,
+    get: function() { return location; },
+    set: function() { /* blocked */ }
   });
-}catch(e){}
+} catch(e) {}
+// Report iframe load errors to Android via URL scheme
+var iframe = document.getElementById('player');
+iframe.addEventListener('error', function() {
+  window.__playerError = true;
+}, true);
 </script>
 </body>
 </html>"""
