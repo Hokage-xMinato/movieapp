@@ -187,8 +187,8 @@ class SmartWebViewClient(
         "mailto", "whatsapp", "tg", "viber", "fb", "twitter"
     )
 
-    // JS injected into every frame to spoof desktop browser fingerprint.
-    // Never touches navigation — only read-only navigator properties.
+    // JS injected into every frame to spoof desktop browser fingerprint
+    // and ensure player controls (SVG icons, skip buttons) are fully visible.
     private val SPOOF_JS = """
         (function() {
             try {
@@ -199,6 +199,21 @@ class SmartWebViewClient(
                 Object.defineProperty(navigator, 'userAgent',     { get: function() {
                     return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
                 }});
+            } catch(e) {}
+
+            // Fix viewport so player renders at device width without desktop scaling.
+            // This ensures skip buttons and all player controls are visible and tappable.
+            try {
+                var existing = document.querySelector('meta[name=viewport]');
+                var content = 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no';
+                if (existing) {
+                    existing.setAttribute('content', content);
+                } else {
+                    var m = document.createElement('meta');
+                    m.name = 'viewport';
+                    m.content = content;
+                    (document.head || document.documentElement).appendChild(m);
+                }
             } catch(e) {}
         })();
     """.trimIndent()
@@ -214,18 +229,28 @@ class SmartWebViewClient(
         request: WebResourceRequest?
     ): WebResourceResponse? = null  // never intercept — let everything load
 
-    // Hosts whose ROOT page (path "/" or empty) should be blocked to prevent
-    // the user landing on the main website. Embed sub-paths on these hosts
-    // (e.g. /embed/movie/…) are still allowed — only the bare homepage is blocked.
-    private val BLOCK_ROOT_HOSTS = setOf("vidsrcme.ru")
-
-    // ── Top-level navigation: block app-escape schemes + specific root pages ──
+    // ── Top-level navigation: block app-escape schemes + vidsrcme.ru root ───
     // shouldOverrideUrlLoading fires when the TOP-LEVEL WebView frame would
     // navigate. It does NOT fire for iframe src changes or resource loads.
-    // We only block (a) schemes that would open another app, and (b) navigations
-    // to the bare homepage of hosts in BLOCK_ROOT_HOSTS (path is "/" or empty).
-    // All other http/https URLs are allowed so the vidsrc redirect chain
-    // (vidsrc → cloudnestra → sub-player → CDN) completes inside the view.
+    // We block:
+    //   1. Non-http schemes that would escape to another app (intent, market, etc.)
+    //   2. https://vidsrcme.ru/ with no meaningful path (the main website) —
+    //      but NOT embed paths like /embed/movie/... or /embed/tv/... which must load.
+    // All other http/https URLs are allowed so the vidsrc redirect chain completes.
+
+    private fun isBlockedRootSite(url: android.net.Uri): Boolean {
+        val scheme = url.scheme?.lowercase() ?: return false
+        if (scheme != "http" && scheme != "https") return false
+        val host = url.host?.lowercase()?.removePrefix("www.") ?: return false
+        // Only block the vidsrcme.ru main website (root or homepage, no embed path)
+        if (host == "vidsrcme.ru") {
+            val path = url.path?.trimEnd('/') ?: ""
+            // Block root, empty path, or paths that don't start with /embed
+            return !path.startsWith("/embed")
+        }
+        return false
+    }
+
     override fun shouldOverrideUrlLoading(
         view: WebView?,
         request: WebResourceRequest?
@@ -236,13 +261,10 @@ class SmartWebViewClient(
         if (scheme in ESCAPE_SCHEMES) return true
         // data: and blob: are internal — always allow
         if (scheme == "data" || scheme == "blob") return false
-        if (scheme == "http" || scheme == "https") {
-            // Block navigations to the bare root of BLOCK_ROOT_HOSTS
-            val host = url.host?.lowercase()?.removePrefix("www.") ?: ""
-            val path = url.path ?: ""
-            if (host in BLOCK_ROOT_HOSTS && (path.isEmpty() || path == "/")) return true
-            return false
-        }
+        // Block vidsrcme.ru root site (non-embed navigation)
+        if (isBlockedRootSite(url)) return true
+        // http/https: allow — the player redirect chain needs this
+        if (scheme == "http" || scheme == "https") return false
         // Unknown scheme: block to be safe
         return true
     }
@@ -252,14 +274,10 @@ class SmartWebViewClient(
         if (url == null) return true
         if (url.startsWith("about:") || url.startsWith("data:") || url.startsWith("blob:")) return false
         val parsed = try { Uri.parse(url) } catch (e: Exception) { return true }
-        val scheme = parsed.scheme?.lowercase() ?: ""
+        val scheme = parsed.scheme?.lowercase() ?: return true
         if (scheme in ESCAPE_SCHEMES) return true
-        if (scheme == "http" || scheme == "https") {
-            val host = parsed.host?.lowercase()?.removePrefix("www.") ?: ""
-            val path = parsed.path ?: ""
-            if (host in BLOCK_ROOT_HOSTS && (path.isEmpty() || path == "/")) return true
-            return false
-        }
+        if (isBlockedRootSite(parsed)) return true
+        if (scheme == "http" || scheme == "https") return false
         return true
     }
 
@@ -329,8 +347,10 @@ class SmartChromeClient(
     // These are the ONLY domains allowed to open a popup that routes back into
     // the main WebView. Everything else (ad popunders, click-redirectors, etc.)
     // is silently dropped by returning false from onCreateWindow.
+    // Note: vidsrcme.ru is intentionally NOT listed here — the root site is blocked.
+    // The embed paths (/embed/...) are loaded directly, not via popups.
     private val POPUP_ALLOWED_HOSTS = setOf(
-        "vidsrc.me", "vidsrcme.ru", "vidsrc.to", "vidsrc.xyz",
+        "vidsrc.me", "vidsrc.to", "vidsrc.xyz",
         "vidsrc.net", "vidsrc.in", "vidsrc.pm", "vidsrc.rip",
         "cloudnestra.com"
     )
@@ -530,7 +550,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var detailOverview: TextView
     private lateinit var playButton: Button
     private lateinit var playerModal: LinearLayout
-    private lateinit var playerTitleBar: LinearLayout
     private lateinit var videoContainer: FrameLayout
     private lateinit var fullscreenContainer: FrameLayout
     private lateinit var closePlayer: ImageButton
@@ -604,7 +623,6 @@ class MainActivity : AppCompatActivity() {
         detailOverview = findViewById(R.id.detailOverview)
         playButton = findViewById(R.id.playButton)
         playerModal = findViewById(R.id.playerModal)
-        playerTitleBar = findViewById(R.id.playerTitleBar)
         videoContainer = findViewById(R.id.videoContainer)
         fullscreenContainer = findViewById(R.id.fullscreenContainer)
         closePlayer = findViewById(R.id.closePlayer)
@@ -668,29 +686,18 @@ class MainActivity : AppCompatActivity() {
                     ctrl.systemBarsBehavior =
                         WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
                 }
-                // Hide only the player chrome (title bar + controls) — NOT the whole
-                // playerModal. If we hide playerModal the window background (#0a0a0f)
-                // bleeds through behind the fullscreenContainer (which is on the decor
-                // root). Keeping playerModal VISIBLE but invisible-chrome means the
-                // black background of playerModal fills the window while fullscreen.
-                playerTitleBar.visibility = View.GONE
-                tvControls.visibility = View.GONE
-                movieControls.visibility = View.GONE
+                // Hide the entire playerModal so the app chrome (title, controls)
+                // disappears — only the fullscreenContainer (attached to decor root)
+                // is visible, covering 100% of the window.
+                playerModal.visibility = View.INVISIBLE
             },
             onFullscreenExit = {
-                // Restore portrait, system UI, and all player chrome
+                // Restore portrait, system UI, and player modal
                 requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
                 WindowCompat.setDecorFitsSystemWindows(window, true)
                 WindowInsetsControllerCompat(window, window.decorView)
                     .show(WindowInsetsCompat.Type.systemBars())
-                playerTitleBar.visibility = View.VISIBLE
-                // Restore controls visibility to whatever they were before fullscreen
-                // (tvControls is shown for TV, movieControls for movies)
-                if (currentType == "tv") {
-                    tvControls.visibility = View.VISIBLE
-                } else {
-                    movieControls.visibility = View.VISIBLE
-                }
+                playerModal.visibility = View.VISIBLE
             }
         ).also { chromeClient = it }
         val s = playerWebView.settings
@@ -703,16 +710,16 @@ class MainActivity : AppCompatActivity() {
         s.allowContentAccess = false
         s.setSupportMultipleWindows(true)
         s.javaScriptCanOpenWindowsAutomatically = true
-        // CRITICAL: useWideViewPort + loadWithOverviewMode make the page scale
-        // to fit the WebView's physical width. Without these, a desktop-width
-        // page (~1280px) is rendered at full size inside a 400px box — the
-        // player's left/right tap zones are pushed off-screen, so every touch
-        // hits the "middle" zone (play/pause) instead of skip-back/skip-forward.
-        s.useWideViewPort = true
-        s.loadWithOverviewMode = true
+        // useWideViewPort=true + loadWithOverviewMode=true would shrink a desktop-width
+        // page (1280px) into the phone screen, crushing player buttons off-screen.
+        // Instead we let the page render at device width and rely on our SPOOF_JS
+        // viewport meta injection to ensure the player fits properly.
+        s.useWideViewPort = false
+        s.loadWithOverviewMode = false
         s.setSupportZoom(false)
         s.builtInZoomControls = false
         s.displayZoomControls = false
+        s.textZoom = 100  // Don't scale text — player uses em/rem sizing
         // Full desktop Chrome 124 UA — no "Android", no "Mobile", no "wv" (WebView marker)
         // This is the single most important thing to make vidsrc not redirect to google.com
         s.userAgentString =
@@ -930,9 +937,6 @@ class MainActivity : AppCompatActivity() {
     // ─── Player ──────────────────────────────────────────────────────────────
 
     private fun openPlayer(type: String) {
-        // If the player is already visible, don't reload — the user tapped "Play"
-        // from the detail page while the player modal was already open.
-        if (playerModal.visibility == View.VISIBLE) return
         playerModal.visibility = View.VISIBLE
         playerLoadingOverlay.visibility = View.VISIBLE
         playerTitle.text = detailTitle.text
