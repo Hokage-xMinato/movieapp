@@ -43,6 +43,6 @@ jobs:
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4
         with:
-          name: Smarterz-debug-APK
+          name: MoviesFan-debug-APK
           path: app/build/outputs/apk/debug/app-debug.apk
           retention-days: 2
