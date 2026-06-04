@@ -160,78 +160,39 @@ class TmdbApi {
 }
 
 // ─── WebViewClient ─────────────────────────────────────────────────────────────
-// Strategy: we load a local HTML wrapper page (base URL = https://vidsrc.me/)
-// which contains an <iframe> pointing at the real embed URL.
-// The top frame is our wrapper — it never navigates away.
-// shouldOverrideUrlLoading blocks ALL top-frame navigation to anything except
-// our wrapper's own origin and the known player/CDN hosts.
-// Resource requests (scripts, media, XHR) are allowed freely so the player works.
+// Loads the embed URL directly. Blocks intent/market/app-store schemes and known
+// ad redirect hosts. Allows all https navigation so player CDN hops work freely.
 
 class SmartWebViewClient(
     private val onPageReady: () -> Unit,
     private val onError: ((String) -> Unit)? = null
 ) : WebViewClient() {
 
-    // Hosts whose pages are allowed to load in the top frame (our wrapper + player domains)
-    private val PLAYER_HOSTS = setOf(
-        "vidsrc.me", "vidsrcme.ru", "vidsrc.to", "vidsrc.xyz",
-        "vidsrc.net", "vidsrc.in", "vidsrc.pm", "vidsrc.rip",
-        "cloudnestra.com", "multiembed.mov", "moviesapi.club",
-        "embedme.top", "vid2fcdn.xyz", "superembed.stream"
-    )
-
+    // Schemes that must never load — ads use these to open apps / stores
     private val BLOCKED_SCHEMES = setOf(
         "intent", "android-app", "market", "tel", "sms",
-        "mailto", "whatsapp", "tg", "javascript"
+        "mailto", "whatsapp", "tg"
     )
 
-    // JS injected into EVERY page/frame to kill ad tricks and spoof browser fingerprint
+    // Hosts that are pure ad/redirect landing pages — block navigation to these
+    private val BLOCKED_HOSTS = setOf(
+        "googleadservices.com", "doubleclick.net", "googlesyndication.com",
+        "adservice.google.com", "ads.google.com", "pagead2.googlesyndication.com",
+        "play.google.com", "apps.apple.com", "itunes.apple.com"
+    )
+
+    // JS injected into EVERY page/frame to spoof browser fingerprint only.
+    // Do NOT touch window.location, window.open, or any navigation — the player needs those.
     private val SPOOF_JS = """
         (function() {
-            // ── Kill all dialog / popup / navigation tricks ──────────────────
-            window.alert   = function() {};
-            window.confirm = function() { return false; };
-            window.prompt  = function() { return null; };
-            window.open    = function() { return null; };
-            // Block location redirects from ad scripts
-            var _href = window.location.href;
             try {
-                Object.defineProperty(window, 'location', {
-                    get: function() { return window._safeLocation || location; },
-                    set: function(v) { /* swallow */ }
-                });
-            } catch(e) {}
-            // ── Spoof navigator so vidsrc thinks we are a real browser ───────
-            try {
-                Object.defineProperty(navigator, 'webdriver', { get: function() { return false; } });
-                Object.defineProperty(navigator, 'platform',  { get: function() { return 'Win32'; } });
-                Object.defineProperty(navigator, 'vendor',    { get: function() { return 'Google Inc.'; } });
-                Object.defineProperty(navigator, 'appVersion',{ get: function() {
-                    return '5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
-                }});
-                Object.defineProperty(navigator, 'userAgent', { get: function() {
+                Object.defineProperty(navigator, 'webdriver',    { get: function() { return false; } });
+                Object.defineProperty(navigator, 'platform',     { get: function() { return 'Win32'; } });
+                Object.defineProperty(navigator, 'vendor',       { get: function() { return 'Google Inc.'; } });
+                Object.defineProperty(navigator, 'maxTouchPoints',{ get: function() { return 0; } });
+                Object.defineProperty(navigator, 'userAgent',    { get: function() {
                     return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
                 }});
-                // Remove Android/mobile UA clues
-                Object.defineProperty(navigator, 'maxTouchPoints', { get: function() { return 0; } });
-            } catch(e) {}
-            // ── Spoof screen / window sizes (desktop) ────────────────────────
-            try {
-                Object.defineProperty(screen, 'width',       { get: function() { return 1920; } });
-                Object.defineProperty(screen, 'height',      { get: function() { return 1080; } });
-                Object.defineProperty(screen, 'availWidth',  { get: function() { return 1920; } });
-                Object.defineProperty(screen, 'availHeight', { get: function() { return 1040; } });
-                Object.defineProperty(window, 'outerWidth',  { get: function() { return 1920; } });
-                Object.defineProperty(window, 'outerHeight', { get: function() { return 1040; } });
-            } catch(e) {}
-            // ── Hide WebView-specific properties ─────────────────────────────
-            try { delete window._phantom; } catch(e) {}
-            try { delete window.callPhantom; } catch(e) {}
-            // ── Make document.referrer look like we came from a normal site ──
-            try {
-                Object.defineProperty(document, 'referrer', {
-                    get: function() { return 'https://www.google.com/'; }
-                });
             } catch(e) {}
         })();
     """.trimIndent()
@@ -254,22 +215,24 @@ class SmartWebViewClient(
     ): Boolean {
         val url = request?.url ?: return true
         val scheme = url.scheme?.lowercase() ?: ""
-        // Kill all non-http schemes (intent://, market://, etc.)
-        if (scheme in BLOCKED_SCHEMES || scheme !in listOf("http", "https")) return true
-        val host = url.host?.lowercase()?.removePrefix("www.") ?: return true
-        // Allow navigation only to known player hosts; block everything else (ads)
-        return !PLAYER_HOSTS.any { host == it || host.endsWith(".$it") }
+        // Block non-http schemes (intent://, market://, etc.)
+        if (scheme in BLOCKED_SCHEMES) return true
+        if (scheme !in listOf("http", "https", "data", "blob")) return true
+        val host = url.host?.lowercase()?.removePrefix("www.") ?: return false
+        // Block known ad landing pages
+        return BLOCKED_HOSTS.any { host == it || host.endsWith(".$it") }
     }
 
     @Suppress("DEPRECATION")
     override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean {
         if (url == null) return true
-        if (url.startsWith("about:") || url.startsWith("data:")) return false
+        if (url.startsWith("about:") || url.startsWith("data:") || url.startsWith("blob:")) return false
         val uri = try { Uri.parse(url) } catch (e: Exception) { return true }
         val scheme = uri.scheme?.lowercase() ?: ""
-        if (scheme in BLOCKED_SCHEMES || scheme !in listOf("http", "https")) return true
-        val host = uri.host?.lowercase()?.removePrefix("www.") ?: return true
-        return !PLAYER_HOSTS.any { host == it || host.endsWith(".$it") }
+        if (scheme in BLOCKED_SCHEMES) return true
+        if (scheme !in listOf("http", "https", "data", "blob")) return true
+        val host = uri.host?.lowercase()?.removePrefix("www.") ?: return false
+        return BLOCKED_HOSTS.any { host == it || host.endsWith(".$it") }
     }
 
     override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
