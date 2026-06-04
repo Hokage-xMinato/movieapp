@@ -2,17 +2,22 @@ package com.smarterz.app
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.pm.ActivityInfo
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
 import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.webkit.*
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.recyclerview.widget.GridLayoutManager
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -318,8 +323,42 @@ class SmartWebViewClient(
 }
 
 class SmartChromeClient(
-    private val playerHosts: Set<String>
+    private val playerHosts: Set<String>,
+    private val fullscreenContainer: FrameLayout,
+    private val onFullscreenEnter: () -> Unit,
+    private val onFullscreenExit: () -> Unit
 ) : WebChromeClient() {
+
+    private var customView: View? = null
+    private var customViewCallback: CustomViewCallback? = null
+
+    // Called when the video player requests fullscreen (user taps fullscreen button)
+    override fun onShowCustomView(view: View?, callback: CustomViewCallback?) {
+        customView = view ?: return
+        customViewCallback = callback
+        fullscreenContainer.addView(customView, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        fullscreenContainer.visibility = View.VISIBLE
+        onFullscreenEnter()
+    }
+
+    // Called when fullscreen is dismissed (user taps back/exit in fullscreen player)
+    override fun onHideCustomView() {
+        fullscreenContainer.removeView(customView)
+        fullscreenContainer.visibility = View.GONE
+        customViewCallback?.onCustomViewHidden()
+        customView = null
+        customViewCallback = null
+        onFullscreenExit()
+    }
+
+    fun isFullscreen() = customView != null
+
+    fun exitFullscreenIfNeeded(): Boolean {
+        return if (customView != null) {
+            onHideCustomView()
+            true
+        } else false
+    }
 
     // vidsrc sometimes opens sub-players via window.open — we allow those
     // but route them back through the same WebView with the same restrictions.
@@ -449,7 +488,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var detailBadgeType: TextView
     private lateinit var detailOverview: TextView
     private lateinit var playButton: Button
-    private lateinit var playerModal: FrameLayout
+    private lateinit var playerModal: LinearLayout
+    private lateinit var videoContainer: FrameLayout
+    private lateinit var fullscreenContainer: FrameLayout
     private lateinit var closePlayer: ImageButton
     private lateinit var playerWebView: WebView
     private lateinit var playerLoadingOverlay: FrameLayout
@@ -461,6 +502,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var episodeSpinner: Spinner
     private lateinit var prevEpBtn: ImageButton
     private lateinit var nextEpBtn: ImageButton
+    private lateinit var chromeClient: SmartChromeClient
 
     // State
     private val api = TmdbApi()
@@ -520,6 +562,8 @@ class MainActivity : AppCompatActivity() {
         detailOverview = findViewById(R.id.detailOverview)
         playButton = findViewById(R.id.playButton)
         playerModal = findViewById(R.id.playerModal)
+        videoContainer = findViewById(R.id.videoContainer)
+        fullscreenContainer = findViewById(R.id.fullscreenContainer)
         closePlayer = findViewById(R.id.closePlayer)
         playerWebView = findViewById(R.id.playerWebView)
         playerLoadingOverlay = findViewById(R.id.playerLoadingOverlay)
@@ -531,6 +575,13 @@ class MainActivity : AppCompatActivity() {
         episodeSpinner = findViewById(R.id.episodeSpinner)
         prevEpBtn = findViewById(R.id.prevEpisodeBtn)
         nextEpBtn = findViewById(R.id.nextEpisodeBtn)
+
+        // Set videoContainer to 16:9 based on screen width
+        val screenWidth = resources.displayMetrics.widthPixels
+        val videoHeight = screenWidth * 9 / 16
+        videoContainer.layoutParams = videoContainer.layoutParams.apply {
+            height = videoHeight
+        }
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -554,7 +605,32 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         )
-        playerWebView.webChromeClient = SmartChromeClient(playerHosts)
+        playerWebView.webChromeClient = SmartChromeClient(
+            playerHosts = playerHosts,
+            fullscreenContainer = fullscreenContainer,
+            onFullscreenEnter = {
+                // Go true fullscreen: landscape, hide system UI
+                requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+                WindowCompat.setDecorFitsSystemWindows(window, false)
+                WindowInsetsControllerCompat(window, window.decorView).let { ctrl ->
+                    ctrl.hide(WindowInsetsCompat.Type.systemBars())
+                    ctrl.systemBarsBehavior =
+                        WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                }
+                // Expand fullscreenContainer to cover the whole window
+                fullscreenContainer.layoutParams = FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                )
+            },
+            onFullscreenExit = {
+                // Restore portrait and system UI
+                requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                WindowCompat.setDecorFitsSystemWindows(window, true)
+                WindowInsetsControllerCompat(window, window.decorView)
+                    .show(WindowInsetsCompat.Type.systemBars())
+            }
+        ).also { chromeClient = it }
         val s = playerWebView.settings
         s.javaScriptEnabled = true
         s.domStorageEnabled = true
@@ -892,6 +968,8 @@ class MainActivity : AppCompatActivity() {
     @Suppress("DEPRECATION")
     override fun onBackPressed() {
         when {
+            // If in fullscreen video, exit fullscreen first — don't close player
+            playerModal.visibility == View.VISIBLE && ::chromeClient.isInitialized && chromeClient.exitFullscreenIfNeeded() -> { /* fullscreen exited */ }
             playerModal.visibility == View.VISIBLE -> closePlayer()
             detailSection.visibility == View.VISIBLE -> {
                 if (lastQuery.isNotEmpty()) {
