@@ -380,6 +380,8 @@
         android:layout_height="match_parent"
         android:orientation="vertical"
         android:background="#000000"
+        android:clickable="true"
+        android:focusable="true"
         android:visibility="gone">
 
         <!-- 16:9 video container -->
@@ -424,6 +426,7 @@
 
         <!-- Title bar directly below video -->
         <LinearLayout
+            android:id="@+id/playerTitleBar"
             android:layout_width="match_parent"
             android:layout_height="48dp"
             android:orientation="horizontal"
