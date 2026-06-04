@@ -710,12 +710,14 @@ class MainActivity : AppCompatActivity() {
         s.allowContentAccess = false
         s.setSupportMultipleWindows(true)
         s.javaScriptCanOpenWindowsAutomatically = true
-        // useWideViewPort=true + loadWithOverviewMode=true would shrink a desktop-width
-        // page (1280px) into the phone screen, crushing player buttons off-screen.
-        // Instead we let the page render at device width and rely on our SPOOF_JS
-        // viewport meta injection to ensure the player fits properly.
-        s.useWideViewPort = false
-        s.loadWithOverviewMode = false
+        // useWideViewPort=true is required so the WebView respects the viewport meta tag.
+        // Without it, window.innerWidth / element.offsetWidth report incorrect values,
+        // which breaks videojs-mobile-ui's left/right zone detection (double-tap seek).
+        // The SPOOF_JS viewport injection (width=device-width) then ensures the page
+        // reflows to actual device width, so the player fills the screen and
+        // offsetWidth is correct — fixing double-tap left/right seek zones.
+        s.useWideViewPort = true
+        s.loadWithOverviewMode = true
         s.setSupportZoom(false)
         s.builtInZoomControls = false
         s.displayZoomControls = false
