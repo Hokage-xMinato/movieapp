@@ -319,10 +319,27 @@ class SmartChromeClient(
     )
 
     // ── Fullscreen ────────────────────────────────────────────────────────────
+    // When the player requests fullscreen, we attach the custom video surface
+    // directly to the window's decor view (the true root of the window, above
+    // all Activity layouts). This guarantees it covers 100% of the screen —
+    // no app chrome, no title bar, no player controls bleed through.
     override fun onShowCustomView(view: View?, callback: CustomViewCallback?) {
+        if (customView != null) {
+            // Already in fullscreen — dismiss existing first
+            onHideCustomView()
+            return
+        }
         customView = view ?: return
         customViewCallback = callback
-        fullscreenContainer.addView(customView, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+
+        // Add directly to the window decor view so it sits above everything
+        fullscreenContainer.addView(
+            customView,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        )
         fullscreenContainer.visibility = View.VISIBLE
         onFullscreenEnter()
     }
@@ -593,6 +610,21 @@ class MainActivity : AppCompatActivity() {
 
     @SuppressLint("SetJavaScriptEnabled")
     private fun setupWebView() {
+        // Move fullscreenContainer out of the Activity layout and into the
+        // window's decor view root. This makes it a true overlay that sits
+        // above ALL Activity content — nothing bleeds through when fullscreen.
+        val decor = window.decorView as FrameLayout
+        (fullscreenContainer.parent as? ViewGroup)?.removeView(fullscreenContainer)
+        decor.addView(
+            fullscreenContainer,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        )
+        fullscreenContainer.visibility = View.GONE
+        fullscreenContainer.setBackgroundColor(Color.BLACK)
+
         playerWebView.webViewClient = SmartWebViewClient(
             onPageReady = { playerLoadingOverlay.visibility = View.GONE },
             onError = { message ->
@@ -609,7 +641,7 @@ class MainActivity : AppCompatActivity() {
         playerWebView.webChromeClient = SmartChromeClient(
             fullscreenContainer = fullscreenContainer,
             onFullscreenEnter = {
-                // Go true fullscreen: landscape, hide system UI
+                // Rotate to landscape and hide all system UI
                 requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
                 WindowCompat.setDecorFitsSystemWindows(window, false)
                 WindowInsetsControllerCompat(window, window.decorView).let { ctrl ->
@@ -617,18 +649,18 @@ class MainActivity : AppCompatActivity() {
                     ctrl.systemBarsBehavior =
                         WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
                 }
-                // Expand fullscreenContainer to cover the whole window
-                fullscreenContainer.layoutParams = FrameLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.MATCH_PARENT
-                )
+                // Hide the entire playerModal so the app chrome (title, controls)
+                // disappears — only the fullscreenContainer (attached to decor root)
+                // is visible, covering 100% of the window.
+                playerModal.visibility = View.INVISIBLE
             },
             onFullscreenExit = {
-                // Restore portrait and system UI
+                // Restore portrait, system UI, and player modal
                 requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
                 WindowCompat.setDecorFitsSystemWindows(window, true)
                 WindowInsetsControllerCompat(window, window.decorView)
                     .show(WindowInsetsCompat.Type.systemBars())
+                playerModal.visibility = View.VISIBLE
             }
         ).also { chromeClient = it }
         val s = playerWebView.settings
@@ -641,8 +673,16 @@ class MainActivity : AppCompatActivity() {
         s.allowContentAccess = false
         s.setSupportMultipleWindows(true)
         s.javaScriptCanOpenWindowsAutomatically = true
-        s.loadWithOverviewMode = false
-        s.useWideViewPort = false
+        // CRITICAL: useWideViewPort + loadWithOverviewMode make the page scale
+        // to fit the WebView's physical width. Without these, a desktop-width
+        // page (~1280px) is rendered at full size inside a 400px box — the
+        // player's left/right tap zones are pushed off-screen, so every touch
+        // hits the "middle" zone (play/pause) instead of skip-back/skip-forward.
+        s.useWideViewPort = true
+        s.loadWithOverviewMode = true
+        s.setSupportZoom(false)
+        s.builtInZoomControls = false
+        s.displayZoomControls = false
         // Full desktop Chrome 124 UA — no "Android", no "Mobile", no "wv" (WebView marker)
         // This is the single most important thing to make vidsrc not redirect to google.com
         s.userAgentString =
