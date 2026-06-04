@@ -203,24 +203,6 @@ class SmartWebViewClient(
         })();
     """.trimIndent()
 
-    // JS injected after page load to ensure the viewport meta tag is set correctly
-    // so the vidsrc player renders at the WebView's actual pixel width (not at a
-    // desktop-scale 1280px then shrunk). Without this, skip/forward buttons are
-    // tiny because the player lays itself out at full desktop width.
-    private val VIEWPORT_FIX_JS = """
-        (function() {
-            try {
-                var meta = document.querySelector('meta[name="viewport"]');
-                if (!meta) {
-                    meta = document.createElement('meta');
-                    meta.name = 'viewport';
-                    document.head.appendChild(meta);
-                }
-                meta.content = 'width=device-width, initial-scale=1.0, maximum-scale=1.0';
-            } catch(e) {}
-        })();
-    """.trimIndent()
-
     // ── Resources: allow everything ──────────────────────────────────────────
     // shouldInterceptRequest fires for every sub-resource inside every iframe.
     // Returning null means "let the WebView handle it normally" — which is
@@ -285,13 +267,11 @@ class SmartWebViewClient(
     override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
         super.onPageStarted(view, url, favicon)
         view?.evaluateJavascript(SPOOF_JS, null)
-        view?.evaluateJavascript(VIEWPORT_FIX_JS, null)
     }
 
     override fun onPageFinished(view: WebView?, url: String?) {
         super.onPageFinished(view, url)
         view?.evaluateJavascript(SPOOF_JS, null)
-        view?.evaluateJavascript(VIEWPORT_FIX_JS, null)
         // Only fire onPageReady for the main frame, not sub-frame completions
         if (url != null && url != "about:blank" && view?.url == url) {
             onPageReady()
