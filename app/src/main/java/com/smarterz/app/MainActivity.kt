@@ -187,21 +187,15 @@ class SmartWebViewClient(
         "mailto", "whatsapp", "tg", "viber", "fb", "twitter"
     )
 
-    // JS injected into every frame to spoof desktop browser fingerprint
-    // and ensure player controls (SVG icons, skip buttons) are fully visible.
+    // JS injected into every frame to ensure player controls are fully visible
+    // and bypass basic webdriver checks without spoofing a desktop platform.
     private val SPOOF_JS = """
         (function() {
             try {
-                Object.defineProperty(navigator, 'webdriver',     { get: function() { return false; } });
-                Object.defineProperty(navigator, 'platform',      { get: function() { return 'Win32'; } });
-                Object.defineProperty(navigator, 'vendor',        { get: function() { return 'Google Inc.'; } });
-                Object.defineProperty(navigator, 'maxTouchPoints',{ get: function() { return 0; } });
-                Object.defineProperty(navigator, 'userAgent',     { get: function() {
-                    return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
-                }});
+                Object.defineProperty(navigator, 'webdriver', { get: function() { return false; } });
             } catch(e) {}
 
-            // Fix viewport so player renders at device width without desktop scaling.
+            // Fix viewport so player renders at accurate mobile device width.
             // This ensures skip buttons and all player controls are visible and tappable.
             try {
                 var existing = document.querySelector('meta[name=viewport]');
@@ -217,7 +211,6 @@ class SmartWebViewClient(
             } catch(e) {}
         })();
     """.trimIndent()
-
     // ── Resources: allow everything ──────────────────────────────────────────
     // shouldInterceptRequest fires for every sub-resource inside every iframe.
     // Returning null means "let the WebView handle it normally" — which is
@@ -710,21 +703,21 @@ class MainActivity : AppCompatActivity() {
         s.allowContentAccess = false
         s.setSupportMultipleWindows(true)
         s.javaScriptCanOpenWindowsAutomatically = true
-        // useWideViewPort=true + loadWithOverviewMode=true would shrink a desktop-width
-        // page (1280px) into the phone screen, crushing player buttons off-screen.
-        // Instead we let the page render at device width and rely on our SPOOF_JS
-        // viewport meta injection to ensure the player fits properly.
-        s.useWideViewPort = false
-        s.loadWithOverviewMode = false
+        
+        // Enable these to allow the WebView and iframes to respect mobile dimensions 
+        // and meta viewport tags properly.
+        s.useWideViewPort = true
+        s.loadWithOverviewMode = true
         s.setSupportZoom(false)
         s.builtInZoomControls = false
         s.displayZoomControls = false
-        s.textZoom = 100  // Don't scale text — player uses em/rem sizing
-        // Full desktop Chrome 124 UA — no "Android", no "Mobile", no "wv" (WebView marker)
-        // This is the single most important thing to make vidsrc not redirect to google.com
-        s.userAgentString =
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        s.textZoom = 100  
+
+        // Use a standard modern Android Mobile User-Agent.
+        // This solves the Cloudnestra infinite loading loop by matching the UA 
+        // to the actual mobile hardware footprint.
+        s.userAgentString = "Mozilla/5.0 (Linux; Android 13; SM-S911B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+        
         CookieManager.getInstance().apply {
             setAcceptCookie(true)
             setAcceptThirdPartyCookies(playerWebView, true)
