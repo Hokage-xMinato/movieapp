@@ -3,6 +3,7 @@ package com.smarterz.app
 import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.ActivityInfo
+import android.content.res.Configuration
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
@@ -187,14 +188,19 @@ class SmartWebViewClient(
         "mailto", "whatsapp", "tg", "viber", "fb", "twitter"
     )
 
-    // JS injected into every frame to ensure player controls are fully visible
-    // and bypass basic webdriver checks without spoofing a desktop platform.
+    // JS injected into every frame to ensure player controls are fully visible,
+    // bypass basic webdriver checks, and block ad overlays from exiting fullscreen.
     private val SPOOF_JS = """
         (function() {
+            if (window.__smarterz_patched) return;
+            window.__smarterz_patched = true;
+
+            // ── 1. Hide webdriver fingerprint ──────────────────────────────────
             try {
                 Object.defineProperty(navigator, 'webdriver', { get: function() { return false; } });
             } catch(e) {}
 
+            // ── 2. Fix viewport meta ───────────────────────────────────────────
             try {
                 var existing = document.querySelector('meta[name=viewport]');
                 var content = 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no';
@@ -208,14 +214,87 @@ class SmartWebViewClient(
                 }
             } catch(e) {}
 
-            // Prevent ad scripts from force-exiting fullscreen when their invisible overlay is clicked.
+            // ── 3. Freeze all fullscreen-exit APIs ─────────────────────────────
+            // Ad scripts call these to collapse the fullscreen view when their
+            // invisible overlay link is tapped.
             try {
-                var keepFullscreen = function() { return Promise.resolve(); };
-                document.exitFullscreen = keepFullscreen;
-                document.webkitExitFullscreen = keepFullscreen;
-                document.webkitCancelFullScreen = keepFullscreen;
-                document.mozCancelFullScreen = keepFullscreen;
-                document.msExitFullscreen = keepFullscreen;
+                var noop = function() { return Promise.resolve(); };
+                Object.defineProperty(document, 'exitFullscreen',         { get: function() { return noop; }, configurable: true });
+                Object.defineProperty(document, 'webkitExitFullscreen',   { get: function() { return noop; }, configurable: true });
+                Object.defineProperty(document, 'webkitCancelFullScreen', { get: function() { return noop; }, configurable: true });
+                Object.defineProperty(document, 'mozCancelFullScreen',    { get: function() { return noop; }, configurable: true });
+                Object.defineProperty(document, 'msExitFullscreen',       { get: function() { return noop; }, configurable: true });
+            } catch(e) {}
+
+            // ── 4. Block ad overlay anchor clicks at capture phase ─────────────
+            // Ad overlays are typically: a full-viewport <a> or <div> with a
+            // z-index above the video, no visible text, positioned absolute/fixed.
+            // We intercept every click in the capture phase (fires before the
+            // element's own handler). If the target or its ancestor is an <a>
+            // that looks like an ad overlay, we stop the event dead — preventing
+            // both the navigation AND any side-effect that would trigger a
+            // native fullscreen exit in the Android WebView.
+            try {
+                function isAdOverlayAnchor(el) {
+                    // Walk up max 5 levels to find an <a> tag
+                    var node = el;
+                    for (var i = 0; i < 5; i++) {
+                        if (!node || node === document.body) break;
+                        if (node.tagName === 'A') {
+                            var href = (node.getAttribute('href') || '').trim();
+                            var style = window.getComputedStyle(node);
+                            var pos = style.position;
+                            // An ad overlay anchor has an external href, covers a
+                            // large area, and is positioned absolutely/fixed.
+                            if (href && href !== '#' && !href.startsWith('javascript') &&
+                                (pos === 'absolute' || pos === 'fixed') &&
+                                node.offsetWidth > 100 && node.offsetHeight > 100) {
+                                return true;
+                            }
+                            // Also block any <a> whose only child is the video/player
+                            // container (common ad trick: wrap player in a link).
+                            if (href && href !== '#' && !href.startsWith('javascript') &&
+                                node.children.length <= 1) {
+                                var rect = node.getBoundingClientRect();
+                                if (rect.width > window.innerWidth * 0.5 &&
+                                    rect.height > window.innerHeight * 0.5) {
+                                    return true;
+                                }
+                            }
+                        }
+                        node = node.parentElement;
+                    }
+                    return false;
+                }
+
+                document.addEventListener('click', function(e) {
+                    if (isAdOverlayAnchor(e.target)) {
+                        e.preventDefault();
+                        e.stopImmediatePropagation();
+                    }
+                }, true);  // true = capture phase, fires before any element handler
+
+                // Also intercept touchend at capture phase (some overlays use touch)
+                document.addEventListener('touchend', function(e) {
+                    if (isAdOverlayAnchor(e.target)) {
+                        e.preventDefault();
+                        e.stopImmediatePropagation();
+                    }
+                }, true);
+            } catch(e) {}
+
+            // ── 5. Neutralise window.location / window.open ad redirects ──────
+            // Some ad scripts bypass <a> clicks and call these directly.
+            try {
+                var _open = window.open;
+                window.open = function(url, name, features) {
+                    // Only allow opens that look like player sub-frames
+                    if (url && (url.indexOf('vidsrc') !== -1 || url.indexOf('cloudnestra') !== -1)) {
+                        return _open.call(window, url, name, features);
+                    }
+                    // Block everything else silently
+                    return { closed: true, close: function(){} };
+                };
             } catch(e) {}
         })();
     """.trimIndent()
@@ -344,6 +423,11 @@ class SmartChromeClient(
     private var customView: View? = null
     private var customViewCallback: CustomViewCallback? = null
 
+    // When true, the next onHideCustomView call is intentional (user action or
+    // back-press) and should actually exit fullscreen. When false, any
+    // onHideCustomView triggered by an ad click is immediately re-entered.
+    var allowFullscreenExit: Boolean = false
+
     // Strict allowlist for window.open / target=_blank popups.
     // These are the ONLY domains allowed to open a popup that routes back into
     // the main WebView. Everything else (ad popunders, click-redirectors, etc.)
@@ -383,18 +467,46 @@ class SmartChromeClient(
     }
 
     override fun onHideCustomView() {
+        if (!allowFullscreenExit && customView != null) {
+            // This exit was NOT triggered by a deliberate user action (back-press
+            // or close button). It almost certainly came from an ad overlay click
+            // that slipped past the JS guard. Re-enter fullscreen immediately by
+            // re-attaching the custom view — the user never sees any flicker.
+            val savedView = customView ?: return
+            val savedCallback = customViewCallback
+
+            // Briefly detach and re-attach so the player surface resets cleanly.
+            fullscreenContainer.removeView(savedView)
+            fullscreenContainer.addView(
+                savedView,
+                FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                )
+            )
+            fullscreenContainer.visibility = View.VISIBLE
+            // Re-apply system UI flags in case Android cleared them
+            onFullscreenEnter()
+            return
+        }
+
         fullscreenContainer.removeView(customView)
         fullscreenContainer.visibility = View.GONE
         customViewCallback?.onCustomViewHidden()
         customView = null
         customViewCallback = null
+        allowFullscreenExit = false   // reset for next time
         onFullscreenExit()
     }
 
     fun isFullscreen() = customView != null
 
     fun exitFullscreenIfNeeded(): Boolean {
-        return if (customView != null) { onHideCustomView(); true } else false
+        return if (customView != null) {
+            allowFullscreenExit = true   // this IS an intentional exit
+            onHideCustomView()
+            true
+        } else false
     }
 
     // ── Popup windows (window.open / target=_blank) ───────────────────────────
@@ -685,8 +797,14 @@ class MainActivity : AppCompatActivity() {
         playerWebView.webChromeClient = SmartChromeClient(
             fullscreenContainer = fullscreenContainer,
             onFullscreenEnter = {
-                // Rotate to landscape and hide all system UI
-                requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+                // Reset the exit guard — the next exit must be explicitly allowed.
+                chromeClient.allowFullscreenExit = false
+                // Lock to landscape and hide all system UI.
+                // SCREEN_ORIENTATION_SENSOR_LANDSCAPE allows both landscape
+                // directions but refuses portrait — so ad-click-induced orientation
+                // resets cannot flip the device back to portrait.
+                requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 WindowCompat.setDecorFitsSystemWindows(window, false)
                 WindowInsetsControllerCompat(window, window.decorView).let { ctrl ->
                     ctrl.hide(WindowInsetsCompat.Type.systemBars())
@@ -701,6 +819,7 @@ class MainActivity : AppCompatActivity() {
             onFullscreenExit = {
                 // Restore portrait, system UI, and player modal
                 requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 WindowCompat.setDecorFitsSystemWindows(window, true)
                 WindowInsetsControllerCompat(window, window.decorView)
                     .show(WindowInsetsCompat.Type.systemBars())
@@ -784,7 +903,11 @@ class MainActivity : AppCompatActivity() {
             if (searchPage < totalPages) doSearch(lastQuery, searchPage + 1)
         }
 
-        closePlayer.setOnClickListener { closePlayer() }
+        closePlayer.setOnClickListener {
+            // Mark as intentional so onHideCustomView doesn't fight the close
+            if (::chromeClient.isInitialized) chromeClient.allowFullscreenExit = true
+            closePlayer()
+        }
 
         prevEpBtn.setOnClickListener {
             if (currentEpisode > 1) {
@@ -973,6 +1096,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun closePlayer() {
+        // Always mark as intentional before closing so the fullscreen guard
+        // doesn't try to re-enter fullscreen during teardown.
+        if (::chromeClient.isInitialized) chromeClient.allowFullscreenExit = true
+        // If we're in fullscreen, collapse it first so orientation resets cleanly.
+        if (::chromeClient.isInitialized) chromeClient.exitFullscreenIfNeeded()
         playerModal.visibility = View.GONE
         playerLoadingOverlay.visibility = View.VISIBLE
         playerWebView.stopLoading()
@@ -1068,6 +1196,27 @@ class MainActivity : AppCompatActivity() {
                 showHome()
             }
             else -> super.onBackPressed()
+        }
+    }
+
+    // Re-lock orientation to landscape whenever a configuration change fires
+    // while the video is in fullscreen mode. This catches the race where an ad
+    // overlay click triggers an orientation reset before the JS guard or the
+    // onHideCustomView guard can suppress it.
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        if (::chromeClient.isInitialized && chromeClient.isFullscreen()) {
+            if (newConfig.orientation == Configuration.ORIENTATION_PORTRAIT) {
+                // Re-lock to landscape — stay in fullscreen
+                requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            }
+            // Re-apply immersive flags in case the system UI reappeared
+            WindowCompat.setDecorFitsSystemWindows(window, false)
+            WindowInsetsControllerCompat(window, window.decorView).let { ctrl ->
+                ctrl.hide(WindowInsetsCompat.Type.systemBars())
+                ctrl.systemBarsBehavior =
+                    WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            }
         }
     }
 
