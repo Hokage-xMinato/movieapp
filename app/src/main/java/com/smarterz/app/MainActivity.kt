@@ -7,6 +7,8 @@ import android.content.res.Configuration
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
@@ -160,40 +162,17 @@ class TmdbApi {
 }
 
 // ─── WebViewClient ─────────────────────────────────────────────────────────────
-// Philosophy: treat the WebView exactly like a browser iframe on a website.
-//
-// RESOURCES  (shouldInterceptRequest)  — allow everything, no exceptions.
-//   Iframes inside vidsrc can load fonts, HLS segments, subtitles, player JS,
-//   thumbnails from any CDN on any domain. We never touch resources.
-//
-// TOP-LEVEL NAVIGATION  (shouldOverrideUrlLoading)  — minimal blocking.
-//   Only hard-block non-http schemes (intent://, market://) that would escape
-//   the WebView and open another app. All http/https navigation is allowed so
-//   the vidsrc → cloudnestra → sub-player redirect chain completes naturally.
-//
-// POPUPS  (onCreateWindow in SmartChromeClient)  — strict allowlist.
-//   window.open / target=_blank are the only true "external" surface. Only
-//   vidsrc domains and cloudnestra.com may open a popup; everything else is
-//   silently dropped. Allowed popups are routed back into the same WebView.
 
 class SmartWebViewClient(
     private val onPageReady: () -> Unit,
     private val onError: ((String) -> Unit)? = null
 ) : WebViewClient() {
 
-    // Only block schemes that would escape the WebView and launch another app.
-    // Do NOT add http/https hosts here — that breaks the player redirect chain.
     private val ESCAPE_SCHEMES = setOf(
         "intent", "android-app", "market", "tel", "sms",
         "mailto", "whatsapp", "tg", "viber", "fb", "twitter"
     )
 
-    // JS injected into every frame. Two jobs:
-    //   A) Spoof environment so the player loads correctly.
-    //   B) Proactively destroy ad overlay elements before they can ever be
-    //      clicked, using a MutationObserver that watches the entire DOM tree
-    //      in real time. If an overlay somehow survives, click/touchend capture
-    //      stops the event without any side-effects.
     private val SPOOF_JS = """
         (function() {
             if (window.__sz_patched) return;
@@ -227,16 +206,18 @@ class SmartWebViewClient(
                 };
             } catch(e) {}
 
-            // ── B. Ad overlay eliminator ───────────────────────────────────────
-            // An ad overlay is any element that:
-            //   • Covers a large portion of the screen (>40% width AND >40% height)
-            //   • Is positioned absolute or fixed (floats above the player)
-            //   • Has an href pointing outside the player domain, OR has a click
-            //     handler that would navigate away
-            // We handle it in two passes:
-            //   1. REMOVE: if it's a pure ad node with no player content, delete it
-            //   2. NEUTER: if unsure, set pointer-events:none so taps fall through
+            // ── A4. Block document.webkitExitFullscreen / exitFullscreen ───────
+            // Some ads call exitFullscreen() directly to dismiss the player's
+            // fullscreen, then open a new window. Intercept and no-op that call.
+            try {
+                var _exit = document.exitFullscreen || document.webkitExitFullscreen;
+                if (_exit) {
+                    document.exitFullscreen = function() { return Promise.resolve(); };
+                    document.webkitExitFullscreen = function() {};
+                }
+            } catch(e) {}
 
+            // ── B. Ad overlay eliminator ───────────────────────────────────────
             function isAdOverlay(el) {
                 try {
                     if (!el || !el.tagName) return false;
@@ -245,24 +226,17 @@ class SmartWebViewClient(
                     var pos = style.position;
                     if (pos !== 'absolute' && pos !== 'fixed') return false;
 
-                    // Must cover a large area of the screen
                     var rect = el.getBoundingClientRect();
                     var sw = window.innerWidth || document.documentElement.clientWidth || 1;
                     var sh = window.innerHeight || document.documentElement.clientHeight || 1;
                     if (rect.width < sw * 0.4 || rect.height < sh * 0.4) return false;
 
-                    // Must be an <a> with an external href, OR a clickable div/span
-                    // sitting on top with no video/iframe content inside
                     if (tag === 'A') {
                         var href = (el.getAttribute('href') || '').trim();
                         if (!href || href === '#' || href.startsWith('javascript')) return false;
-                        // It's a large, positioned anchor -> ad overlay
                         return true;
                     }
-                    // For non-anchor elements: only flag if they contain no video/iframe
-                    // (so we don't accidentally nuke the player wrapper)
                     if (el.querySelector('video, iframe, canvas')) return false;
-                    // Has an onclick that looks like navigation
                     var oc = el.getAttribute('onclick') || '';
                     if (oc && (oc.indexOf('location') !== -1 || oc.indexOf('open') !== -1)) return true;
                     return false;
@@ -271,12 +245,10 @@ class SmartWebViewClient(
 
             function eliminateOverlay(el) {
                 try {
-                    // Prefer removal for pure <a> ad overlays
                     if (el.tagName && el.tagName.toUpperCase() === 'A') {
                         el.remove();
                         return;
                     }
-                    // For other elements, just make them untappable
                     el.style.setProperty('pointer-events', 'none', 'important');
                     el.style.setProperty('z-index', '-9999', 'important');
                 } catch(e) {}
@@ -295,25 +267,22 @@ class SmartWebViewClient(
                 } catch(e) {}
             }
 
-            // Run once immediately on current DOM
             if (document.readyState === 'loading') {
                 document.addEventListener('DOMContentLoaded', function() { scanAndEliminate(document); });
             } else {
                 scanAndEliminate(document);
             }
 
-            // Watch for any new nodes being inserted (ads inject themselves dynamically)
             try {
                 var observer = new MutationObserver(function(mutations) {
                     for (var i = 0; i < mutations.length; i++) {
                         var added = mutations[i].addedNodes;
                         for (var j = 0; j < added.length; j++) {
                             var node = added[j];
-                            if (node.nodeType !== 1) continue; // elements only
+                            if (node.nodeType !== 1) continue;
                             if (isAdOverlay(node)) {
                                 eliminateOverlay(node);
                             } else if (node.querySelectorAll) {
-                                // Also scan children of newly added nodes
                                 scanAndEliminate(node);
                             }
                         }
@@ -326,10 +295,6 @@ class SmartWebViewClient(
             } catch(e) {}
 
             // ── B2. Last-resort: click/touch capture ───────────────────────────
-            // If an overlay survives both passes above, stop the event here.
-            // This is identical to what the non-fullscreen WebViewClient already
-            // does for top-level navigations — just preventDefault/stopPropagation,
-            // no side effects, no fullscreen involvement at all.
             try {
                 function blockIfOverlay(e) {
                     var node = e.target;
@@ -338,7 +303,7 @@ class SmartWebViewClient(
                         if (isAdOverlay(node)) {
                             e.preventDefault();
                             e.stopImmediatePropagation();
-                            eliminateOverlay(node); // clean it up now too
+                            eliminateOverlay(node);
                             return;
                         }
                         node = node.parentElement;
@@ -349,34 +314,18 @@ class SmartWebViewClient(
             } catch(e) {}
         })();
     """.trimIndent()
-    // ── Resources: allow everything ──────────────────────────────────────────
-    // shouldInterceptRequest fires for every sub-resource inside every iframe.
-    // Returning null means "let the WebView handle it normally" — which is
-    // exactly what we want. CDN segments, subtitles, poster images, player JS,
-    // ad tracker pixels — all pass through. We are NOT an ad blocker at the
-    // resource level; our only job is keeping the video stream intact.
+
     override fun shouldInterceptRequest(
         view: WebView?,
         request: WebResourceRequest?
-    ): WebResourceResponse? = null  // never intercept — let everything load
-
-    // ── Top-level navigation: block app-escape schemes + vidsrcme.ru root ───
-    // shouldOverrideUrlLoading fires when the TOP-LEVEL WebView frame would
-    // navigate. It does NOT fire for iframe src changes or resource loads.
-    // We block:
-    //   1. Non-http schemes that would escape to another app (intent, market, etc.)
-    //   2. https://vidsrcme.ru/ with no meaningful path (the main website) —
-    //      but NOT embed paths like /embed/movie/... or /embed/tv/... which must load.
-    // All other http/https URLs are allowed so the vidsrc redirect chain completes.
+    ): WebResourceResponse? = null
 
     private fun isBlockedRootSite(url: android.net.Uri): Boolean {
         val scheme = url.scheme?.lowercase() ?: return false
         if (scheme != "http" && scheme != "https") return false
         val host = url.host?.lowercase()?.removePrefix("www.") ?: return false
-        // Only block the vidsrcme.ru main website (root or homepage, no embed path)
         if (host == "vidsrcme.ru") {
             val path = url.path?.trimEnd('/') ?: ""
-            // Block root, empty path, or paths that don't start with /embed
             return !path.startsWith("/embed")
         }
         return false
@@ -388,15 +337,10 @@ class SmartWebViewClient(
     ): Boolean {
         val url = request?.url ?: return true
         val scheme = url.scheme?.lowercase() ?: ""
-        // Hard-block any scheme that would escape to another app
         if (scheme in ESCAPE_SCHEMES) return true
-        // data: and blob: are internal — always allow
         if (scheme == "data" || scheme == "blob") return false
-        // Block vidsrcme.ru root site (non-embed navigation)
         if (isBlockedRootSite(url)) return true
-        // http/https: allow — the player redirect chain needs this
         if (scheme == "http" || scheme == "https") return false
-        // Unknown scheme: block to be safe
         return true
     }
 
@@ -412,7 +356,6 @@ class SmartWebViewClient(
         return true
     }
 
-    // ── Page lifecycle ────────────────────────────────────────────────────────
     override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
         super.onPageStarted(view, url, favicon)
         view?.evaluateJavascript(SPOOF_JS, null)
@@ -421,13 +364,11 @@ class SmartWebViewClient(
     override fun onPageFinished(view: WebView?, url: String?) {
         super.onPageFinished(view, url)
         view?.evaluateJavascript(SPOOF_JS, null)
-        // Only fire onPageReady for the main frame, not sub-frame completions
         if (url != null && url != "about:blank" && view?.url == url) {
             onPageReady()
         }
     }
 
-    // ── Errors: only surface fatal main-frame failures ────────────────────────
     override fun onReceivedError(
         view: WebView?,
         request: WebResourceRequest?,
@@ -437,7 +378,6 @@ class SmartWebViewClient(
         if (request?.isForMainFrame == true) {
             val code = error?.errorCode ?: -1
             val desc = error?.description?.toString() ?: "Unknown error"
-            // -2 = net::ERR_FAILED (common during redirect chain) — don't surface
             if (code != -2) onError?.invoke("Player error ($code): $desc")
         }
     }
@@ -456,7 +396,6 @@ class SmartWebViewClient(
         errorResponse: WebResourceResponse?
     ) {
         super.onReceivedHttpError(view, request, errorResponse)
-        // Only 5xx on the main frame is a real failure worth showing
         if (request?.isForMainFrame == true && (errorResponse?.statusCode ?: 0) >= 500) {
             onError?.invoke("Player failed to load (HTTP ${errorResponse?.statusCode}). Please try again.")
         }
@@ -464,6 +403,8 @@ class SmartWebViewClient(
 
     override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?) = true
 }
+
+// ─── SmartChromeClient ────────────────────────────────────────────────────────
 
 class SmartChromeClient(
     private val fullscreenContainer: FrameLayout,
@@ -474,33 +415,51 @@ class SmartChromeClient(
     private var customView: View? = null
     private var customViewCallback: CustomViewCallback? = null
 
-    // Strict allowlist for window.open / target=_blank popups.
-    // These are the ONLY domains allowed to open a popup that routes back into
-    // the main WebView. Everything else (ad popunders, click-redirectors, etc.)
-    // is silently dropped by returning false from onCreateWindow.
-    // Note: vidsrcme.ru is intentionally NOT listed here — the root site is blocked.
-    // The embed paths (/embed/...) are loaded directly, not via popups.
+    // ── Fullscreen re-entry guard ─────────────────────────────────────────────
+    // Problem: some ad scripts call exitFullscreen() or trigger a navigation
+    // that causes the WebView engine to call onHideCustomView() spuriously —
+    // i.e. the user never tapped "exit fullscreen", but the fullscreen view
+    // disappears anyway.
+    //
+    // Fix: track whether we are *intentionally* exiting (user closed the player
+    // or tapped the back button) via intentionalExit. If onHideCustomView fires
+    // without intentionalExit being set, we treat it as a spurious ad-driven
+    // exit and immediately re-enter fullscreen by re-showing the custom view.
+    private var intentionalExit = false
+
+    // Re-entry handler — posted with a tiny delay so the WebView can finish its
+    // own cleanup before we re-attach the custom view.
+    private val reEntryHandler = Handler(Looper.getMainLooper())
+    private var pendingReEntry: Runnable? = null
+
     private val POPUP_ALLOWED_HOSTS = setOf(
         "vidsrc.me", "vidsrc.to", "vidsrc.xyz",
         "vidsrc.net", "vidsrc.in", "vidsrc.pm", "vidsrc.rip",
         "cloudnestra.com"
     )
 
-    // ── Fullscreen ────────────────────────────────────────────────────────────
-    // When the player requests fullscreen, we attach the custom video surface
-    // directly to the window's decor view (the true root of the window, above
-    // all Activity layouts). This guarantees it covers 100% of the screen —
-    // no app chrome, no title bar, no player controls bleed through.
+    // Call this BEFORE triggering any action that should legitimately exit
+    // fullscreen (user-initiated close, back press, closePlayer()).
+    fun markIntentionalExit() {
+        intentionalExit = true
+        // Auto-reset after a short window so stray calls don't leave the flag set
+        reEntryHandler.postDelayed({ intentionalExit = false }, 1000)
+    }
+
+    // ── Fullscreen enter ──────────────────────────────────────────────────────
     override fun onShowCustomView(view: View?, callback: CustomViewCallback?) {
+        // Cancel any pending spurious re-entry (rare but safe)
+        pendingReEntry?.let { reEntryHandler.removeCallbacks(it) }
+        pendingReEntry = null
+
         if (customView != null) {
-            // Already in fullscreen — dismiss existing first
             onHideCustomView()
             return
         }
         customView = view ?: return
         customViewCallback = callback
+        intentionalExit = false   // fresh fullscreen session — reset the flag
 
-        // Add directly to the window decor view so it sits above everything
         fullscreenContainer.addView(
             customView,
             FrameLayout.LayoutParams(
@@ -512,8 +471,58 @@ class SmartChromeClient(
         onFullscreenEnter()
     }
 
+    // ── Fullscreen exit ───────────────────────────────────────────────────────
     override fun onHideCustomView() {
-        fullscreenContainer.removeView(customView)
+        val view = customView ?: return   // already hidden, nothing to do
+
+        if (!intentionalExit) {
+            // ── Spurious exit (ad-driven) ──────────────────────────────────────
+            // The WebView engine called us without the user asking to exit.
+            // Strategy:
+            //   1. Let the WebView finish its bookkeeping by completing the hide
+            //      cycle (remove/re-add the custom view, reset the callback).
+            //   2. Immediately re-attach the custom view to the container so the
+            //      fullscreen surface is never actually gone from the user's POV.
+            //   3. Do NOT call onFullscreenExit — the app chrome must stay hidden.
+
+            // Step 1 — detach from container temporarily
+            fullscreenContainer.removeView(view)
+            // Acknowledge the callback so the WebView doesn't hang
+            customViewCallback?.onCustomViewHidden()
+            customViewCallback = null
+            // Keep customView reference — we're going to re-add it
+
+            // Step 2 — re-attach on next frame
+            val savedView = view
+            val reEntry = Runnable {
+                if (customView == savedView) {         // still the same session
+                    try {
+                        fullscreenContainer.addView(
+                            savedView,
+                            FrameLayout.LayoutParams(
+                                ViewGroup.LayoutParams.MATCH_PARENT,
+                                ViewGroup.LayoutParams.MATCH_PARENT
+                            )
+                        )
+                        fullscreenContainer.visibility = View.VISIBLE
+                    } catch (e: Exception) {
+                        // View already has a parent or session ended — give up cleanly
+                        customView = null
+                        onFullscreenExit()
+                    }
+                }
+            }
+            pendingReEntry = reEntry
+            reEntryHandler.post(reEntry)
+            return
+        }
+
+        // ── Intentional exit ──────────────────────────────────────────────────
+        pendingReEntry?.let { reEntryHandler.removeCallbacks(it) }
+        pendingReEntry = null
+        intentionalExit = false
+
+        fullscreenContainer.removeView(view)
         fullscreenContainer.visibility = View.GONE
         customViewCallback?.onCustomViewHidden()
         customView = null
@@ -523,20 +532,16 @@ class SmartChromeClient(
 
     fun isFullscreen() = customView != null
 
+    // Mark intentional before exiting so onHideCustomView allows it
     fun exitFullscreenIfNeeded(): Boolean {
-        return if (customView != null) { onHideCustomView(); true } else false
+        return if (customView != null) {
+            markIntentionalExit()
+            onHideCustomView()
+            true
+        } else false
     }
 
-    // ── Popup windows (window.open / target=_blank) ───────────────────────────
-    // This is the ONE place we enforce a strict allowlist.
-    // How it works:
-    //   1. Create a temporary invisible WebView to receive the popup.
-    //   2. That WebView's client intercepts the first navigation request.
-    //   3. If the destination host is in POPUP_ALLOWED_HOSTS, load it in the
-    //      MAIN WebView (so it plays inside the player, not a new window).
-    //   4. Anything else is silently dropped — the temp WebView is discarded.
-    //   5. The site never knows the popup was handled differently; it just
-    //      sees a successful window.open() return value.
+    // ── Popup windows ─────────────────────────────────────────────────────────
     override fun onCreateWindow(
         view: WebView?,
         isDialog: Boolean,
@@ -546,22 +551,18 @@ class SmartChromeClient(
         val mainView = view ?: return false
         val transport = resultMsg?.obj as? WebView.WebViewTransport ?: return false
 
-        // Temp WebView — strictly invisible and unfocusable so it doesn't steal 
-        // Android window focus and accidentally dismiss the fullscreen CustomView.
         val tempWebView = WebView(mainView.context).apply {
             visibility = View.GONE
             isFocusable = false
             isFocusableInTouchMode = false
         }
-        
+
         tempWebView.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(v: WebView?, req: WebResourceRequest?): Boolean {
                 val host = req?.url?.host?.lowercase()?.removePrefix("www.") ?: return true
                 if (POPUP_ALLOWED_HOSTS.any { host == it || host.endsWith(".$it") }) {
-                    // Route allowed popup back into the main player WebView
                     mainView.loadUrl(req.url.toString())
                 }
-                // Always return true: consume the navigation, never open external browser
                 return true
             }
             @Suppress("DEPRECATION")
@@ -623,7 +624,6 @@ class MediaAdapter(
     override fun onBindViewHolder(h: VH, pos: Int) {
         val item = items[pos]
         h.title.text = item.title
-        // In recently-watched (showRemove=true) show progress; in search results show generic label
         h.detail.text = if (showRemove && item.type == "tv" && item.season > 0) {
             "S${item.season} · E${item.episode}"
         } else {
@@ -774,7 +774,6 @@ class MainActivity : AppCompatActivity() {
         prevEpBtn = findViewById(R.id.prevEpisodeBtn)
         nextEpBtn = findViewById(R.id.nextEpisodeBtn)
 
-        // Set videoContainer to 16:9 based on screen width
         val screenWidth = resources.displayMetrics.widthPixels
         val videoHeight = screenWidth * 9 / 16
         videoContainer.layoutParams = videoContainer.layoutParams.apply {
@@ -784,9 +783,6 @@ class MainActivity : AppCompatActivity() {
 
     @SuppressLint("SetJavaScriptEnabled")
     private fun setupWebView() {
-        // Move fullscreenContainer out of the Activity layout and into the
-        // window's decor view root. This makes it a true overlay that sits
-        // above ALL Activity content — nothing bleeds through when fullscreen.
         val decor = window.decorView as FrameLayout
         (fullscreenContainer.parent as? ViewGroup)?.removeView(fullscreenContainer)
         decor.addView(
@@ -815,10 +811,6 @@ class MainActivity : AppCompatActivity() {
         playerWebView.webChromeClient = SmartChromeClient(
             fullscreenContainer = fullscreenContainer,
             onFullscreenEnter = {
-                // Lock to landscape and hide all system UI.
-                // SCREEN_ORIENTATION_SENSOR_LANDSCAPE allows both landscape
-                // directions but refuses portrait — so ad-click-induced orientation
-                // resets cannot flip the device back to portrait.
                 requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
                 window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 WindowCompat.setDecorFitsSystemWindows(window, false)
@@ -827,13 +819,10 @@ class MainActivity : AppCompatActivity() {
                     ctrl.systemBarsBehavior =
                         WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
                 }
-                // Hide the entire playerModal so the app chrome (title, controls)
-                // disappears — only the fullscreenContainer (attached to decor root)
-                // is visible, covering 100% of the window.
                 playerModal.visibility = View.INVISIBLE
             },
             onFullscreenExit = {
-                // Restore portrait, system UI, and player modal
+                // Only fires for intentional exits — spurious exits are swallowed
                 requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
                 window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 WindowCompat.setDecorFitsSystemWindows(window, true)
@@ -842,6 +831,7 @@ class MainActivity : AppCompatActivity() {
                 playerModal.visibility = View.VISIBLE
             }
         ).also { chromeClient = it }
+
         val s = playerWebView.settings
         s.javaScriptEnabled = true
         s.domStorageEnabled = true
@@ -852,27 +842,19 @@ class MainActivity : AppCompatActivity() {
         s.allowContentAccess = false
         s.setSupportMultipleWindows(true)
         s.javaScriptCanOpenWindowsAutomatically = true
-        
-        // Enable these to allow the WebView and iframes to respect mobile dimensions 
-        // and meta viewport tags properly.
         s.useWideViewPort = true
         s.loadWithOverviewMode = true
         s.setSupportZoom(false)
         s.builtInZoomControls = false
         s.displayZoomControls = false
-        s.textZoom = 100  
-
-        // Use a standard modern Android Mobile User-Agent.
-        // This solves the Cloudnestra infinite loading loop by matching the UA 
-        // to the actual mobile hardware footprint.
+        s.textZoom = 100
         s.userAgentString = "Mozilla/5.0 (Linux; Android 13; SM-S911B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
-        
+
         CookieManager.getInstance().apply {
             setAcceptCookie(true)
             setAcceptThirdPartyCookies(playerWebView, true)
         }
         playerWebView.setBackgroundColor(Color.BLACK)
-        // Silently swallow any download attempts (ad download tricks)
         playerWebView.setDownloadListener { _, _, _, _, _ -> }
     }
 
@@ -919,6 +901,7 @@ class MainActivity : AppCompatActivity() {
             if (searchPage < totalPages) doSearch(lastQuery, searchPage + 1)
         }
 
+        // Mark intentional before closing so the chrome client allows the exit
         closePlayer.setOnClickListener { closePlayer() }
 
         prevEpBtn.setOnClickListener {
@@ -1099,16 +1082,17 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * Loads the embed URL directly in the WebView.
-     * Ad redirects are blocked by SmartWebViewClient.shouldOverrideUrlLoading.
-     */
     private fun loadPlayerFrame(embedUrl: String) {
         playerWebView.loadUrl(embedUrl)
     }
 
     private fun closePlayer() {
-        if (::chromeClient.isInitialized) chromeClient.exitFullscreenIfNeeded()
+        // Must mark intentional BEFORE calling exitFullscreenIfNeeded so the
+        // chrome client flag is set when onHideCustomView fires.
+        if (::chromeClient.isInitialized) {
+            chromeClient.markIntentionalExit()
+            chromeClient.exitFullscreenIfNeeded()
+        }
         playerModal.visibility = View.GONE
         playerLoadingOverlay.visibility = View.VISIBLE
         playerWebView.stopLoading()
@@ -1188,7 +1172,6 @@ class MainActivity : AppCompatActivity() {
     @Suppress("DEPRECATION")
     override fun onBackPressed() {
         when {
-            // If in fullscreen video, exit fullscreen first — don't close player
             playerModal.visibility == View.VISIBLE && ::chromeClient.isInitialized && chromeClient.exitFullscreenIfNeeded() -> { /* fullscreen exited */ }
             playerModal.visibility == View.VISIBLE -> closePlayer()
             detailSection.visibility == View.VISIBLE -> {
@@ -1207,18 +1190,12 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // Re-lock orientation to landscape whenever a configuration change fires
-    // while the video is in fullscreen mode. This catches the race where an ad
-    // overlay click triggers an orientation reset before the JS guard or the
-    // onHideCustomView guard can suppress it.
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         if (::chromeClient.isInitialized && chromeClient.isFullscreen()) {
             if (newConfig.orientation == Configuration.ORIENTATION_PORTRAIT) {
-                // Re-lock to landscape — stay in fullscreen
                 requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
             }
-            // Re-apply immersive flags in case the system UI reappeared
             WindowCompat.setDecorFitsSystemWindows(window, false)
             WindowInsetsControllerCompat(window, window.decorView).let { ctrl ->
                 ctrl.hide(WindowInsetsCompat.Type.systemBars())
