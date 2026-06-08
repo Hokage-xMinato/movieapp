@@ -468,24 +468,12 @@ class SmartChromeClient(
 
     override fun onHideCustomView() {
         if (!allowFullscreenExit && customView != null) {
-            // This exit was NOT triggered by a deliberate user action (back-press
-            // or close button). It almost certainly came from an ad overlay click
-            // that slipped past the JS guard. Re-enter fullscreen immediately by
-            // re-attaching the custom view — the user never sees any flicker.
-            val savedView = customView ?: return
-            val savedCallback = customViewCallback
-
-            // Briefly detach and re-attach so the player surface resets cleanly.
-            fullscreenContainer.removeView(savedView)
-            fullscreenContainer.addView(
-                savedView,
-                FrameLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.MATCH_PARENT
-                )
-            )
-            fullscreenContainer.visibility = View.VISIBLE
-            // Re-apply system UI flags in case Android cleared them
+            // This exit was NOT triggered by a deliberate user action — it came
+            // from an ad overlay click. DO NOT touch the view hierarchy at all:
+            // removing and re-adding a SurfaceView/TextureView kills its surface
+            // and causes a permanent black screen that requires a full restart.
+            // Just re-lock the system UI flags and orientation — everything else
+            // stays exactly as it is, so the video surface is never disturbed.
             onFullscreenEnter()
             return
         }
