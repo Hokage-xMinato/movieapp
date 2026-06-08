@@ -188,113 +188,164 @@ class SmartWebViewClient(
         "mailto", "whatsapp", "tg", "viber", "fb", "twitter"
     )
 
-    // JS injected into every frame to ensure player controls are fully visible,
-    // bypass basic webdriver checks, and block ad overlays from exiting fullscreen.
+    // JS injected into every frame. Two jobs:
+    //   A) Spoof environment so the player loads correctly.
+    //   B) Proactively destroy ad overlay elements before they can ever be
+    //      clicked, using a MutationObserver that watches the entire DOM tree
+    //      in real time. If an overlay somehow survives, click/touchend capture
+    //      stops the event without any side-effects.
     private val SPOOF_JS = """
         (function() {
-            if (window.__smarterz_patched) return;
-            window.__smarterz_patched = true;
+            if (window.__sz_patched) return;
+            window.__sz_patched = true;
 
-            // ── 1. Hide webdriver fingerprint ──────────────────────────────────
+            // ── A1. Webdriver fingerprint ──────────────────────────────────────
             try {
                 Object.defineProperty(navigator, 'webdriver', { get: function() { return false; } });
             } catch(e) {}
 
-            // ── 2. Fix viewport meta ───────────────────────────────────────────
+            // ── A2. Viewport ───────────────────────────────────────────────────
             try {
-                var existing = document.querySelector('meta[name=viewport]');
-                var content = 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no';
-                if (existing) {
-                    existing.setAttribute('content', content);
-                } else {
+                var vp = document.querySelector('meta[name=viewport]');
+                var vc = 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no';
+                if (vp) { vp.setAttribute('content', vc); }
+                else {
                     var m = document.createElement('meta');
-                    m.name = 'viewport';
-                    m.content = content;
+                    m.name = 'viewport'; m.content = vc;
                     (document.head || document.documentElement).appendChild(m);
                 }
             } catch(e) {}
 
-            // ── 3. Freeze all fullscreen-exit APIs ─────────────────────────────
-            // Ad scripts call these to collapse the fullscreen view when their
-            // invisible overlay link is tapped.
-            try {
-                var noop = function() { return Promise.resolve(); };
-                Object.defineProperty(document, 'exitFullscreen',         { get: function() { return noop; }, configurable: true });
-                Object.defineProperty(document, 'webkitExitFullscreen',   { get: function() { return noop; }, configurable: true });
-                Object.defineProperty(document, 'webkitCancelFullScreen', { get: function() { return noop; }, configurable: true });
-                Object.defineProperty(document, 'mozCancelFullScreen',    { get: function() { return noop; }, configurable: true });
-                Object.defineProperty(document, 'msExitFullscreen',       { get: function() { return noop; }, configurable: true });
-            } catch(e) {}
-
-            // ── 4. Block ad overlay anchor clicks at capture phase ─────────────
-            // Ad overlays are typically: a full-viewport <a> or <div> with a
-            // z-index above the video, no visible text, positioned absolute/fixed.
-            // We intercept every click in the capture phase (fires before the
-            // element's own handler). If the target or its ancestor is an <a>
-            // that looks like an ad overlay, we stop the event dead — preventing
-            // both the navigation AND any side-effect that would trigger a
-            // native fullscreen exit in the Android WebView.
-            try {
-                function isAdOverlayAnchor(el) {
-                    // Walk up max 5 levels to find an <a> tag
-                    var node = el;
-                    for (var i = 0; i < 5; i++) {
-                        if (!node || node === document.body) break;
-                        if (node.tagName === 'A') {
-                            var href = (node.getAttribute('href') || '').trim();
-                            var style = window.getComputedStyle(node);
-                            var pos = style.position;
-                            // An ad overlay anchor has an external href, covers a
-                            // large area, and is positioned absolutely/fixed.
-                            if (href && href !== '#' && !href.startsWith('javascript') &&
-                                (pos === 'absolute' || pos === 'fixed') &&
-                                node.offsetWidth > 100 && node.offsetHeight > 100) {
-                                return true;
-                            }
-                            // Also block any <a> whose only child is the video/player
-                            // container (common ad trick: wrap player in a link).
-                            if (href && href !== '#' && !href.startsWith('javascript') &&
-                                node.children.length <= 1) {
-                                var rect = node.getBoundingClientRect();
-                                if (rect.width > window.innerWidth * 0.5 &&
-                                    rect.height > window.innerHeight * 0.5) {
-                                    return true;
-                                }
-                            }
-                        }
-                        node = node.parentElement;
-                    }
-                    return false;
-                }
-
-                document.addEventListener('click', function(e) {
-                    if (isAdOverlayAnchor(e.target)) {
-                        e.preventDefault();
-                        e.stopImmediatePropagation();
-                    }
-                }, true);  // true = capture phase, fires before any element handler
-
-                // Also intercept touchend at capture phase (some overlays use touch)
-                document.addEventListener('touchend', function(e) {
-                    if (isAdOverlayAnchor(e.target)) {
-                        e.preventDefault();
-                        e.stopImmediatePropagation();
-                    }
-                }, true);
-            } catch(e) {}
-
-            // ── 5. Neutralise window.location / window.open ad redirects ──────
-            // Some ad scripts bypass <a> clicks and call these directly.
+            // ── A3. Block window.open for non-player domains ───────────────────
             try {
                 var _open = window.open;
                 window.open = function(url, name, features) {
-                    // Only allow opens that look like player sub-frames
                     if (url && (url.indexOf('vidsrc') !== -1 || url.indexOf('cloudnestra') !== -1)) {
                         return _open.call(window, url, name, features);
                     }
-                    // Block everything else silently
                     return { closed: true, close: function(){} };
                 };
+            } catch(e) {}
+
+            // ── B. Ad overlay eliminator ───────────────────────────────────────
+            // An ad overlay is any element that:
+            //   • Covers a large portion of the screen (>40% width AND >40% height)
+            //   • Is positioned absolute or fixed (floats above the player)
+            //   • Has an href pointing outside the player domain, OR has a click
+            //     handler that would navigate away
+            // We handle it in two passes:
+            //   1. REMOVE: if it's a pure ad node with no player content, delete it
+            //   2. NEUTER: if unsure, set pointer-events:none so taps fall through
+
+            function isAdOverlay(el) {
+                try {
+                    if (!el || !el.tagName) return false;
+                    var tag = el.tagName.toUpperCase();
+                    var style = window.getComputedStyle(el);
+                    var pos = style.position;
+                    if (pos !== 'absolute' && pos !== 'fixed') return false;
+
+                    // Must cover a large area of the screen
+                    var rect = el.getBoundingClientRect();
+                    var sw = window.innerWidth || document.documentElement.clientWidth || 1;
+                    var sh = window.innerHeight || document.documentElement.clientHeight || 1;
+                    if (rect.width < sw * 0.4 || rect.height < sh * 0.4) return false;
+
+                    // Must be an <a> with an external href, OR a clickable div/span
+                    // sitting on top with no video/iframe content inside
+                    if (tag === 'A') {
+                        var href = (el.getAttribute('href') || '').trim();
+                        if (!href || href === '#' || href.startsWith('javascript')) return false;
+                        // It's a large, positioned anchor -> ad overlay
+                        return true;
+                    }
+                    // For non-anchor elements: only flag if they contain no video/iframe
+                    // (so we don't accidentally nuke the player wrapper)
+                    if (el.querySelector('video, iframe, canvas')) return false;
+                    // Has an onclick that looks like navigation
+                    var oc = el.getAttribute('onclick') || '';
+                    if (oc && (oc.indexOf('location') !== -1 || oc.indexOf('open') !== -1)) return true;
+                    return false;
+                } catch(e) { return false; }
+            }
+
+            function eliminateOverlay(el) {
+                try {
+                    // Prefer removal for pure <a> ad overlays
+                    if (el.tagName && el.tagName.toUpperCase() === 'A') {
+                        el.remove();
+                        return;
+                    }
+                    // For other elements, just make them untappable
+                    el.style.setProperty('pointer-events', 'none', 'important');
+                    el.style.setProperty('z-index', '-9999', 'important');
+                } catch(e) {}
+            }
+
+            function scanAndEliminate(root) {
+                try {
+                    var candidates = (root || document).querySelectorAll(
+                        'a[href], div[onclick], span[onclick], div[style*="position"], a[style*="position"]'
+                    );
+                    for (var i = 0; i < candidates.length; i++) {
+                        if (isAdOverlay(candidates[i])) {
+                            eliminateOverlay(candidates[i]);
+                        }
+                    }
+                } catch(e) {}
+            }
+
+            // Run once immediately on current DOM
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', function() { scanAndEliminate(document); });
+            } else {
+                scanAndEliminate(document);
+            }
+
+            // Watch for any new nodes being inserted (ads inject themselves dynamically)
+            try {
+                var observer = new MutationObserver(function(mutations) {
+                    for (var i = 0; i < mutations.length; i++) {
+                        var added = mutations[i].addedNodes;
+                        for (var j = 0; j < added.length; j++) {
+                            var node = added[j];
+                            if (node.nodeType !== 1) continue; // elements only
+                            if (isAdOverlay(node)) {
+                                eliminateOverlay(node);
+                            } else if (node.querySelectorAll) {
+                                // Also scan children of newly added nodes
+                                scanAndEliminate(node);
+                            }
+                        }
+                    }
+                });
+                observer.observe(document.documentElement, {
+                    childList: true,
+                    subtree: true
+                });
+            } catch(e) {}
+
+            // ── B2. Last-resort: click/touch capture ───────────────────────────
+            // If an overlay survives both passes above, stop the event here.
+            // This is identical to what the non-fullscreen WebViewClient already
+            // does for top-level navigations — just preventDefault/stopPropagation,
+            // no side effects, no fullscreen involvement at all.
+            try {
+                function blockIfOverlay(e) {
+                    var node = e.target;
+                    for (var i = 0; i < 6; i++) {
+                        if (!node || node === document.body) break;
+                        if (isAdOverlay(node)) {
+                            e.preventDefault();
+                            e.stopImmediatePropagation();
+                            eliminateOverlay(node); // clean it up now too
+                            return;
+                        }
+                        node = node.parentElement;
+                    }
+                }
+                document.addEventListener('click',    blockIfOverlay, true);
+                document.addEventListener('touchend', blockIfOverlay, true);
             } catch(e) {}
         })();
     """.trimIndent()
@@ -423,11 +474,6 @@ class SmartChromeClient(
     private var customView: View? = null
     private var customViewCallback: CustomViewCallback? = null
 
-    // When true, the next onHideCustomView call is intentional (user action or
-    // back-press) and should actually exit fullscreen. When false, any
-    // onHideCustomView triggered by an ad click is immediately re-entered.
-    var allowFullscreenExit: Boolean = false
-
     // Strict allowlist for window.open / target=_blank popups.
     // These are the ONLY domains allowed to open a popup that routes back into
     // the main WebView. Everything else (ad popunders, click-redirectors, etc.)
@@ -467,34 +513,18 @@ class SmartChromeClient(
     }
 
     override fun onHideCustomView() {
-        if (!allowFullscreenExit && customView != null) {
-            // This exit was NOT triggered by a deliberate user action — it came
-            // from an ad overlay click. DO NOT touch the view hierarchy at all:
-            // removing and re-adding a SurfaceView/TextureView kills its surface
-            // and causes a permanent black screen that requires a full restart.
-            // Just re-lock the system UI flags and orientation — everything else
-            // stays exactly as it is, so the video surface is never disturbed.
-            onFullscreenEnter()
-            return
-        }
-
         fullscreenContainer.removeView(customView)
         fullscreenContainer.visibility = View.GONE
         customViewCallback?.onCustomViewHidden()
         customView = null
         customViewCallback = null
-        allowFullscreenExit = false   // reset for next time
         onFullscreenExit()
     }
 
     fun isFullscreen() = customView != null
 
     fun exitFullscreenIfNeeded(): Boolean {
-        return if (customView != null) {
-            allowFullscreenExit = true   // this IS an intentional exit
-            onHideCustomView()
-            true
-        } else false
+        return if (customView != null) { onHideCustomView(); true } else false
     }
 
     // ── Popup windows (window.open / target=_blank) ───────────────────────────
@@ -785,8 +815,6 @@ class MainActivity : AppCompatActivity() {
         playerWebView.webChromeClient = SmartChromeClient(
             fullscreenContainer = fullscreenContainer,
             onFullscreenEnter = {
-                // Reset the exit guard — the next exit must be explicitly allowed.
-                chromeClient.allowFullscreenExit = false
                 // Lock to landscape and hide all system UI.
                 // SCREEN_ORIENTATION_SENSOR_LANDSCAPE allows both landscape
                 // directions but refuses portrait — so ad-click-induced orientation
@@ -891,11 +919,7 @@ class MainActivity : AppCompatActivity() {
             if (searchPage < totalPages) doSearch(lastQuery, searchPage + 1)
         }
 
-        closePlayer.setOnClickListener {
-            // Mark as intentional so onHideCustomView doesn't fight the close
-            if (::chromeClient.isInitialized) chromeClient.allowFullscreenExit = true
-            closePlayer()
-        }
+        closePlayer.setOnClickListener { closePlayer() }
 
         prevEpBtn.setOnClickListener {
             if (currentEpisode > 1) {
@@ -1084,10 +1108,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun closePlayer() {
-        // Always mark as intentional before closing so the fullscreen guard
-        // doesn't try to re-enter fullscreen during teardown.
-        if (::chromeClient.isInitialized) chromeClient.allowFullscreenExit = true
-        // If we're in fullscreen, collapse it first so orientation resets cleanly.
         if (::chromeClient.isInitialized) chromeClient.exitFullscreenIfNeeded()
         playerModal.visibility = View.GONE
         playerLoadingOverlay.visibility = View.VISIBLE
